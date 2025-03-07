@@ -32,15 +32,40 @@ class FunctionalComponentAnalysis(nn.Module):
         super(FunctionalComponentAnalysis, self).__init__()
         # Sample a single, initial vector and normalize it
         self.size = size
-        self.max_rank = max_rank if max_rank else size
+        self.max_rank = max_rank if max_rank is not None else size
         self.remove_components = remove_components
         initial_vector = torch.randn(size)
         initial_vector = initial_vector / torch.norm(initial_vector)
         self.parameters_list = nn.ParameterList([nn.Parameter(initial_vector)])
+        self.is_fixed = False
+        self.fixed_weight = None
+        self.orthogonalization_vectors = []
 
-    def freeze_parameters(self):
+    def add_orthogonalization_vectors(self, new_vectors):
+        """
+        Args:
+            new_vectors: list of tensors
+        """
+        for vec in new_vectors:
+            self.orthogonalization_vectors.append( vec.data )
+        self.max_rank = self.max_rank - len(new_vectors)
+        print("New Max Rank:", self.max_rank)
+
+    def freeze_parameters(self, freeze=True):
         for p in self.parameters_list:
-            p.requires_grad = False
+            p.requires_grad = freeze
+
+    def freeze_weights(self, freeze=True):
+        self.freeze_parameters(freeze=freeze)
+
+    def set_fixed(self, fixed=True):
+        """
+        Can fix the weight matrix in order to quit calculating
+        orthogonality via gram schmidt.
+        """
+        if fixed:
+            self.fixed_weight = self.weight.data.clone()
+        self.is_fixed = fixed
 
     def orthogonalize_vector(self, new_vector, prev_vectors):
         # Make the new vector orthogonal to all previous vectors using Gram-Schmidt process
@@ -58,10 +83,15 @@ class FunctionalComponentAnalysis(nn.Module):
         parameter list. Does not track gradients.
         """
         # Sample a new vector and orthogonalize it
+        device = self.get_device()
+        self.orthogonalization_vectors = [
+            v.to(device) for v in self.orthogonalization_vectors
+        ]
         params = []
         with torch.no_grad():
             for p in self.parameters_list:
-                p = self.orthogonalize_vector(p, prev_vectors=params)
+                p = self.orthogonalize_vector(
+                    p, prev_vectors=params+self.orthogonalization_vectors)
                 params.append(p)
         self.parameters_list = nn.ParameterList([
             nn.Parameter(p.data) for p in params
@@ -72,10 +102,15 @@ class FunctionalComponentAnalysis(nn.Module):
         Only orthogonalize the parameters that require gradients.
         Does track gradients.
         """
+        device = self.get_device()
+        self.orthogonalization_vectors = [
+            v.to(device) for v in self.orthogonalization_vectors
+        ]
         params = []
         for p in self.parameters_list:
             if p.requires_grad:
-                p = self.orthogonalize_vector(p, prev_vectors=params)
+                p = self.orthogonalize_vector(
+                    p, prev_vectors=params+self.orthogonalization_vectors)
             params.append(p)
         return params
 
@@ -93,8 +128,11 @@ class FunctionalComponentAnalysis(nn.Module):
                 The low rank orthogonal matrix created from
                 the parameter list.
         """
-        params = self.orthogonalize_parameters()
-        matrix = torch.vstack(params)
+        if self.is_fixed and self.fixed_weight is not None:
+            matrix = self.fixed_weight.to(self.get_device())
+        else:
+            params = self.orthogonalize_parameters()
+            matrix = torch.vstack(params)
         if components is not None:
             matrix = matrix[components]
         return matrix
@@ -107,23 +145,52 @@ class FunctionalComponentAnalysis(nn.Module):
     def rank(self):
         return len(self.parameters_list)
 
+    def get_device(self):
+        device = self.parameters_list[0].get_device()
+        return "cpu" if device<0 else device
+
     def add_new_axis_parameter(self):
         if len(self.parameters_list) >= self.max_rank:
             return None
         # Sample a new axis and add it to the parameter list
         new_axis = torch.randn(self.parameters_list[0].shape[0])
-        p = nn.Parameter(new_axis)
+        p = nn.Parameter(new_axis).to(self.get_device())
         self.parameters_list.append(p)
-        return p
+        return self.parameters_list[-1]
 
     def load_sd(self, sd):
         """
         Assists in loading a state dict
         """
+        n_axes = 0
         for k in sd:
             if "parameters_list" in k:
-                self.add_new_axis_parameter()
-        self.load_state_dict(sd)
+                ax = int(k.split(".")[-1])
+                if ax > n_axes:
+                    n_axes = ax
+        for _ in range(n_axes+1-self.rank):
+            self.add_new_axis_parameter()
+        try:
+            self.load_state_dict(sd)
+        except:
+            print("Failed to load sd")
+            print("Current sd:")
+            for k in self.state_dict():
+                print(k, self.state_dict()[k].shape)
+            print("Argued sd:")
+            for k in sd:
+                print(k, sd[k].shape)
+            self.load_state_dict(sd)
+
+    def init_from_fca(self, fca, freeze_params=True):
+        """
+        Simplifies starting the parameters from another fca
+        object
+        """
+        self.load_sd(fca.state_dict())
+        self.freeze_parameters(freeze=freeze_params)
+        p = self.add_new_axis_parameter()
+        return p
 
     def get_forward_hook(self):
         def hook(module, input, output):
@@ -131,7 +198,6 @@ class FunctionalComponentAnalysis(nn.Module):
             stripped = self.forward(fca_vec, inverse=True)
             if self.remove_components:
                 stripped = output - stripped
-                #assert torch.matmul(stripped, self.weight.T).sum()<1e-6
             return stripped
         return hook
 
@@ -143,6 +209,68 @@ class FunctionalComponentAnalysis(nn.Module):
         return torch.matmul(
             x, self.make_matrix(components=components).T
         )
+
+def load_fcas(model, config):
+    """
+    Simplifies the recursive loading of previous fcas.
+    """
+    device = model.get_device()
+    fca_checkpoint = torch.load(config["fca_load_path"])
+    fca_config = fca_checkpoint["config"]
+    fcas = {}
+    loaded_fcas = []
+    loaded_handles = []
+    if fca_config.get("fca_load_path", None) is not None:
+        loaded_fcas, loaded_handles = load_fcas(
+            model=model, config=fca_config)
+    state_dicts = fca_checkpoint["fca_state_dicts"]
+    kwargs = fca_config.get("fca_params", {})
+    for layer,modu in model.named_modules():
+        if layer in fca_config["fca_layers"]:
+            kwargs["size"] = modu.weight.shape[0]
+            kwargs["remove_components"] = True
+            fcas[layer] = FunctionalComponentAnalysis(
+                **kwargs
+            )
+            fcas[layer].load_sd(state_dicts[layer])
+            fcas[layer].update_parameters()
+            fcas[layer].freeze_parameters()
+            fcas[layer].set_fixed(True)
+            fcas[layer].to(device)
+            h = modu.register_forward_hook(
+                fcas[layer].get_forward_hook()
+            )
+            loaded_handles.append(h)
+    loaded_fcas.append(fcas)
+    return loaded_fcas, loaded_handles
+
+def initialize_fcas(model, config, loaded_fcas=[]):
+    device = model.get_device()
+    fca_handles = []
+    fca_parameters = []
+    fcas = {}
+    fca_layers = config["fca_layers"]
+    kwargs = config.get("fca_params", {})
+    for name,modu in model.named_modules():
+        if name in fca_layers:
+            kwargs["size"] = modu.weight.shape[0]
+            fcas[name] = FunctionalComponentAnalysis(
+                **kwargs
+            )
+            fcas[name].to(device)
+            if config.get("ensure_ortho_chain", False):
+                if loaded_fcas:
+                    for loaded in loaded_fcas:
+                        if name in loaded:
+                            fcas[name].add_orthogonalization_vectors(
+                                loaded[name].parameters_list)
+            h = modu.register_forward_hook(
+                fcas[name].get_forward_hook()
+            )
+            fca_handles.append(h)
+            fca_parameters += list(fcas[name].parameters())
+    return fcas, fca_handles, fca_parameters
+    
 
 # Example usage
 if __name__ == "__main__":

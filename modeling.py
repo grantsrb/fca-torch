@@ -29,10 +29,12 @@ class NeuralNetwork(nn.Module):
                 number of hidden layers
             output_size: int
                 size of the output layer
-            nonlinearity: torch.nn.Module
+            nonlinearity: torch.nn.Module or str
                 nonlinearity to use in the hidden layers
         """
         super(NeuralNetwork, self).__init__()
+        if type(nonlinearity)==str:
+            nonlinearity = getattr(torch.nn, nonlinearity)
         if n_layers < 1:
             raise ValueError("n_layers must be greater than 0")
         self.embedding = nn.Embedding(vocab_size, embedding_dim)
@@ -58,6 +60,10 @@ class NeuralNetwork(nn.Module):
             layers.append(nn.LayerNorm(d_model))
         layers.append(nn.Linear(d_model, output_size))
         self.hidden_layers = nn.Sequential(*layers)
+
+    def get_device(self):
+        device = next(self.parameters()).get_device()
+        return device if device>=0 else "cpu"
 
     def freeze_parameters(self):
         for p in self.parameters():

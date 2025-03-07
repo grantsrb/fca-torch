@@ -2,38 +2,12 @@ import torch
 from modeling import NeuralNetwork
 from tasks import HierarchicalLogicalTask, OPERATION2STRING
 import torch.optim as optim
-from fca import FunctionalComponentAnalysis
+from fca import FunctionalComponentAnalysis, load_fcas, initialize_fcas
 import pandas as pd
+import copy
+import os
 
-config = {
-    'task_params': {
-        'n_pairs': 4,
-        'n_samples': 1000,
-    },
-    'model_params': {
-        'embedding_dim': 32,
-        'd_model': 512,
-        'n_layers': 3,
-        'nonlinearity': torch.nn.ReLU,
-        'lnorm': True,
-    },
-    'lr': 0.001,
-    'num_epochs': 10000,
-    'batch_size': 128,
-    "patience": 20,
-    "plateau": 0.01,
-    'model_save_path': 'model.pth',
-    'model_load_path': "model.pth",
-    'fca_load_path': None,
-
-    'fca_params': {"max_rank": 512},
-    'fca_layers': ["hidden_layers.0"],
-    'persistent_keys': [
-        'fca_params', 'fca_layers', 'lr',
-        "batch_size", "model_save_path",
-        "num_epochs", "fca_load_path",
-    ],
-}
+from dl_utils.save_io import record_session, load_checkpoint
 
 class PlateauTracker:
     def __init__(self, **kwargs):
@@ -64,8 +38,11 @@ def train(config, device=None):
     # Load CheckPoint
     checkpoint = None
     if config['model_load_path'] is not None:
-        checkpoint = torch.load(config['model_load_path'])
-        conf = checkpoint['config']
+        checkpoint = load_checkpoint(config['model_load_path'])
+        conf = {
+            **copy.deepcopy(config),
+            **copy.deepcopy(checkpoint['config'])
+        }
         for k in config.get("persistent_keys", []):
             if k in config:
                 conf[k] = config[k]
@@ -90,6 +67,7 @@ def train(config, device=None):
     model = NeuralNetwork(**config['model_params'])
     if checkpoint is not None:
         model.load_state_dict(checkpoint['model_state_dict'])
+    record_session(config=config, model=model, globals_dict=globals())
     model.to(device)
     print(model)
     criterion = torch.nn.CrossEntropyLoss()
@@ -111,30 +89,18 @@ def train(config, device=None):
         "val_loss": [],
         "val_acc": [],
     }
+    fca_layers = config.get("fca_layers", None)
+    if fca_layers is not None and fca_layers:
+        for layer in fca_layers:
+            data_dict[f"fca_{layer}_rank"] = []
 
     # Load trained Functional Component Analysis Objects
+    loaded_fcas = []
+    loaded_handles = []
     if config.get("fca_load_path", None) is not None:
         model.freeze_parameters()
-        fca_checkpoint = torch.load(config["fca_load_path"])
-        state_dicts = fca_checkpoint["fca_state_dicts"]
-        fca_config = fca_checkpoint["config"]
-        kwargs = fca_config.get("fca_params", {})
-        loaded_fcas = {}
-        loaded_handles = []
-        for name,modu in model.named_modules():
-            if name in fca_config["fca_layers"]:
-                kwargs["size"] = modu.weight.shape[-1]
-                kwargs["remove_components"] = True
-                loaded_fcas[name] = FunctionalComponentAnalysis(
-                    **kwargs
-                )
-                loaded_fcas[name].load_sd(state_dicts[name])
-                loaded_fcas[name].update_parameters()
-                loaded_fcas[name].freeze_parameters()
-                h = modu.register_forward_hook(
-                    loaded_fcas[name].get_forward_hook()
-                )
-                loaded_handles.append(h)
+        loaded_fcas, loaded_handles = load_fcas(
+            model=model, config=config)
 
     # Get the initial loss and accuracy
     with torch.no_grad():
@@ -147,11 +113,6 @@ def train(config, device=None):
 
             outputs = model(inputs.to(device))
             preds = outputs.argmax(dim=-1)
-            #for j in range(3):
-            #    print("Input:", " ".join([task.idx2word[int(i)] for i in inputs[j]]))
-            #    print("Label:", int(labels[j]))
-            #    print("Preds:", int(preds[j]))
-            #    print()
             loss = criterion(outputs, labels.to(device))
             acc = (preds == labels.to(device)).float().mean()
             total_loss += loss.item()
@@ -183,111 +144,129 @@ def train(config, device=None):
         data_dict["train_acc"].append(total_acc/task.n_batches(config["batch_size"]))
         data_dict["val_loss"].append(total_loss_val/val_task.n_batches(config["batch_size"]))
         data_dict["val_acc"].append(total_acc_val/val_task.n_batches(config["batch_size"]))
+        if fca_layers:
+            for layer in fca_layers:
+                data_dict[f"fca_{layer}_rank"].append(0)
 
     # Initialize the Functional Component Analysis Objects
     fcas = {}
     fca_handles = []
-    fca_layers = config.get("fca_layers", None)
     if fca_layers is not None and fca_layers:
         model.freeze_parameters()
-        fca_parameters = []
-        kwargs = config.get("fca_params", {})
-        for name,modu in model.named_modules():
-            if name in config["fca_layers"]:
-                kwargs["size"] = modu.weight.shape[-1]
-                fcas[name] = FunctionalComponentAnalysis(
-                    **kwargs
-                )
-                h = modu.register_forward_hook(
-                    fcas[name].get_forward_hook()
-                )
-                fca_handles.append(h)
-                fca_parameters += list(fcas[name].parameters())
+        fcas, fca_handles, fca_parameters = initialize_fcas(
+            model=model,
+            config=config,
+            loaded_fcas=loaded_fcas
+        )
         optimizer = optim.Adam(fca_parameters, lr=config['lr'])
 
     # Training loop
     for epoch in range(1,config['num_epochs']):
-        model.train()
-        total_loss = 0.0
-        total_acc = 0.0
+        #try:
+            model.train()
+            total_loss = 0.0
+            total_acc = 0.0
 
-        for batch in task.get_batches(config['batch_size']):
-            inputs = batch["input_ids"]
-            labels = batch["output_ids"].squeeze()
-
-            optimizer.zero_grad()
-            outputs = model(inputs.to(device))
-            preds = outputs.argmax(dim=-1)
-            loss = criterion(outputs, labels.to(device))
-            acc = (preds == labels.to(device)).float().mean()
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-            total_acc += acc.item()
-
-        with torch.no_grad():
-            model.eval()
-            total_loss_val = 0.0
-            total_acc_val = 0.0
-            for batch in val_task.get_batches(config['batch_size']):
+            for batch in task.get_batches(config['batch_size']):
                 inputs = batch["input_ids"]
-                labels = batch["output_ids"]
+                labels = batch["output_ids"].squeeze()
+
+                optimizer.zero_grad()
                 outputs = model(inputs.to(device))
-                loss = criterion(
-                    outputs,
-                    labels.squeeze().to(device)
-                )
-                acc = (outputs.argmax(dim=-1) == labels.squeeze().to(device)).float().mean()
-                total_loss_val += loss.item()
-                total_acc_val += acc.item()
+                preds = outputs.argmax(dim=-1)
+                loss = criterion(outputs, labels.to(device))
+                acc = (preds == labels.to(device)).float().mean()
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
+                total_acc += acc.item()
 
-        data_dict["epoch"].append(epoch)
-        bsize = config['batch_size']
-        loss = total_loss/task.n_batches(bsize)
-        acc = total_acc/task.n_batches(bsize)
-        data_dict["train_loss"].append(loss)
-        data_dict["train_acc"].append(acc)
-        print(f'Epoch {epoch}/{config["num_epochs"]}')
-        print(f"Trn Loss: {loss}, Trn Acc: {acc}")
-        loss = total_loss_val/val_task.n_batches(bsize)
-        acc = total_acc_val/val_task.n_batches(bsize)
-        data_dict["val_loss"].append(loss)  # val_loss
-        data_dict["val_acc"].append(acc)  # val_acc
-        print(f'Val Loss: {loss}, Val Acc: {acc}')
-        print("Ops:", ", ".join([OPERATION2STRING[o] for o in task.operations]))
-        if fcas:
-            print("FCA Parameters:")
-            for layer,fca in fcas.items():
-                print(f"{layer}: {fca.rank}")
-        print('---')
+            with torch.no_grad():
+                model.eval()
+                total_loss_val = 0.0
+                total_acc_val = 0.0
+                for batch in val_task.get_batches(config['batch_size']):
+                    inputs = batch["input_ids"]
+                    labels = batch["output_ids"]
+                    outputs = model(inputs.to(device))
+                    loss = criterion(
+                        outputs,
+                        labels.squeeze().to(device)
+                    )
+                    acc = (outputs.argmax(dim=-1) == labels.squeeze().to(device)).float().mean()
+                    total_loss_val += loss.item()
+                    total_acc_val += acc.item()
 
-        if plateau_tracker.update(loss, acc):
+            data_dict["epoch"].append(epoch)
+            bsize = config['batch_size']
+            loss = total_loss/task.n_batches(bsize)
+            acc = total_acc/task.n_batches(bsize)
+            data_dict["train_loss"].append(loss)
+            data_dict["train_acc"].append(acc)
+            print(f'Epoch {epoch}/{config["num_epochs"]}')
+            print(f"Trn Loss: {loss}, Trn Acc: {acc}")
+            loss = total_loss_val/val_task.n_batches(bsize)
+            acc = total_acc_val/val_task.n_batches(bsize)
+            data_dict["val_loss"].append(loss)  # val_loss
+            data_dict["val_acc"].append(acc)  # val_acc
+            print(f'Val Loss: {loss}, Val Acc: {acc}')
+            print("Ops:", ", ".join([OPERATION2STRING[o] for o in task.operations]))
             if fcas:
-                print("Updating FCA parameters")
-                new_axes = []
-                for fca in fcas.values():
-                    fca.update_parameters()
-                    fca.freeze_parameters()
-                    p = fca.add_new_axis_parameter()
-                    if p is not None:
-                        new_axes.append(p)
-                if len(new_axes) == 0:
+                print("FCA Parameters:")
+                for layer in fca_layers:
+                    rank = 0
+                    if layer in fcas:
+                        rank = fcas[layer].rank
+                        max_rank = fcas[layer].max_rank
+                        full_rank = fcas[layer].size
+                        print(f"\t{layer}: {rank}/{max_rank}/{full_rank}")
+                    data_dict[f"fca_{layer}_rank"].append(rank)
+            print("Save Dir:", config["save_folder"])
+            print('---')
+
+            if fcas:
+                trn_acc = total_acc/task.n_batches(bsize)
+                val_acc = total_acc_val/val_task.n_batches(bsize)
+                thresh = config.get("fca_acc_threshold", 0.99)
+                if trn_acc>thresh and val_acc>thresh:
+                    print(f"Trn:{trn_acc}, Val:{val_acc} Early Stopping")
+                    break
+            if plateau_tracker.update(loss, acc):
+                if fcas:
+                    print("Updating FCA parameters")
+                    new_axes = []
+                    for fca in fcas.values():
+                        fca.update_parameters()
+                        fca.freeze_parameters()
+                        p = fca.add_new_axis_parameter()
+                        if p is not None:
+                            new_axes.append(p)
+                    if len(new_axes) == 0:
+                        print("FCA Max Rank Early stopping")
+                        break
+                    optimizer = optim.Adam(new_axes, lr=config['lr'])
+                    plateau_tracker.reset()
+                else:
                     print("Early stopping")
                     break
-                optimizer = optim.Adam(new_axes, lr=config['lr'])
-                plateau_tracker.reset()
-            else:
-                print("Early stopping")
-                break
-
+        #except:
+        #    print("Error occurred, closing out")
+        #    break
 
     # Save the trained model
-    save_path = config['model_save_path']
+    save_path = os.path.join(config['save_folder'], "model.pt")
     if fcas:
         if config.get("fca_load_path", None) is not None:
-            save_path = save_path.replace(".pth", "_chained_fca.pth")
+            save_path = config["fca_load_path"]
+            n_chains = 0
+            if "chained" in save_path:
+                try:
+                    n_chains = int(save_path.split("chained")[-1].split(".pt")[0])+1
+                except: pass
+            save_path = save_path.split("_fca")[0]
+            save_path = save_path + f"_fca_chained{n_chains}.pt"
         else:
-            save_path = save_path.replace(".pth", "_fca.pth")
+            save_path = save_path.replace(".pt", "_fca.pt")
         save_dict = {
             "fca_state_dicts": {
                 layer: fca.state_dict() for layer,fca in fcas.items()
@@ -295,6 +274,8 @@ def train(config, device=None):
             "config": config,
         }
         for h in fca_handles:
+            h.remove()
+        for h in loaded_handles:
             h.remove()
     else:
         save_dict = {
@@ -304,10 +285,22 @@ def train(config, device=None):
         }
     print("Saving model to:", save_path)
     torch.save(save_dict, save_path)
-    # Save the training data
     df = pd.DataFrame(data_dict)
-    save_path = save_path.replace(".pth", ".csv")
-    df.to_csv(save_path, index=False, header=True)
-
-if __name__ == "__main__":
-    train(config)
+    csv_path = save_path.replace(".pt", ".csv")
+    df.to_csv(csv_path, index=False, header=True)
+    trn_acc = total_acc/task.n_batches(bsize)
+    trn_loss = total_loss/task.n_batches(bsize)
+    val_acc = total_acc_val/val_task.n_batches(bsize)
+    val_loss = total_loss_val/val_task.n_batches(bsize)
+    metrics = {
+        "ranks": {},
+        "trn_acc":  float(trn_acc),
+        "trn_loss": float(trn_loss), 
+        "val_acc":  float(val_acc),
+        "val_loss": float(val_loss), 
+        "save_path": save_path,
+    }
+    if fcas:
+        for layer in fcas:
+            metrics["ranks"][layer] = fcas[layer].rank
+    return metrics
