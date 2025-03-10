@@ -1,7 +1,7 @@
 import copy
 
 DEFAULTS = {
-    "save_root": "/data2/grantsrb/fca_saves/",
+    "save_root": "/mnt/fs2/grantsrb/fca_saves/",
     "seed": 12345,
     "exp_name": "equal_distro",
     'task_params': {
