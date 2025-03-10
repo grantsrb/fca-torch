@@ -6,8 +6,12 @@ from fca import FunctionalComponentAnalysis, load_fcas, initialize_fcas
 import pandas as pd
 import copy
 import os
+import time
+import warnings
+warnings.filterwarnings('ignore')
 
 from dl_utils.save_io import record_session, load_checkpoint
+from dl_utils.utils import pretty_print_config
 
 class PlateauTracker:
     def __init__(self, **kwargs):
@@ -47,6 +51,9 @@ def train(config, device=None):
             if k in config:
                 conf[k] = config[k]
         config = conf
+
+    print("Using Config:")
+    pretty_print_config(config)
 
     # Initialize the model, task, loss function, and optimizer
     kwargs = {**config['task_params']}
@@ -90,9 +97,13 @@ def train(config, device=None):
         "val_acc": [],
     }
     fca_layers = config.get("fca_layers", None)
-    if fca_layers is not None and fca_layers:
+    do_fca = config.get("do_fca", fca_layers) and fca_layers
+    if do_fca:
+        print("DOING FCA")
         for layer in fca_layers:
             data_dict[f"fca_{layer}_rank"] = []
+    else:
+        print(config)
 
     # Load trained Functional Component Analysis Objects
     loaded_fcas = []
@@ -100,7 +111,7 @@ def train(config, device=None):
     if config.get("fca_load_path", None) is not None:
         model.freeze_parameters()
         loaded_fcas, loaded_handles = load_fcas(
-            model=model, config=config)
+            model=model, load_path=config["fca_load_path"])
 
     # Get the initial loss and accuracy
     with torch.no_grad():
@@ -139,19 +150,28 @@ def train(config, device=None):
         print("Ops:", ", ".join([OPERATION2STRING[o] for o in task.operations]))
         print('---')
 
+        ## Ensure high enough accuracy
+        thresh = config["fca_acc_threshold"]
+        train_acc = total_acc/task.n_batches(config["batch_size"])
+        val_acc = total_acc_val/val_task.n_batches(config["batch_size"])
+        if do_fca and not loaded_fcas and (thresh>train_acc or thresh>val_acc):
+            print("Insufficient Accuracy for FCA Threshold", thresh)
+            return None
+
         data_dict["epoch"].append(0)
         data_dict["train_loss"].append(total_loss/task.n_batches(config["batch_size"]))
-        data_dict["train_acc"].append(total_acc/task.n_batches(config["batch_size"]))
+        data_dict["train_acc"].append(train_acc)
         data_dict["val_loss"].append(total_loss_val/val_task.n_batches(config["batch_size"]))
-        data_dict["val_acc"].append(total_acc_val/val_task.n_batches(config["batch_size"]))
-        if fca_layers:
+        data_dict["val_acc"].append(val_acc)
+        if do_fca:
             for layer in fca_layers:
                 data_dict[f"fca_{layer}_rank"].append(0)
 
     # Initialize the Functional Component Analysis Objects
     fcas = {}
-    fca_handles = []
-    if fca_layers is not None and fca_layers:
+    fca_handles = {}
+    if do_fca:
+        print("Ensuring Ortho", config["ensure_ortho_chain"])
         model.freeze_parameters()
         fcas, fca_handles, fca_parameters = initialize_fcas(
             model=model,
@@ -164,6 +184,7 @@ def train(config, device=None):
     for epoch in range(1,config['num_epochs']):
         #try:
             model.train()
+            startt = time.time()
             total_loss = 0.0
             total_acc = 0.0
 
@@ -222,6 +243,7 @@ def train(config, device=None):
                         print(f"\t{layer}: {rank}/{max_rank}/{full_rank}")
                     data_dict[f"fca_{layer}_rank"].append(rank)
             print("Save Dir:", config["save_folder"])
+            print("Exec Time:", time.time()-startt)
             print('---')
 
             if fcas:
@@ -273,10 +295,11 @@ def train(config, device=None):
             },
             "config": config,
         }
-        for h in fca_handles:
+        for layer,h in fca_handles.items():
             h.remove()
-        for h in loaded_handles:
-            h.remove()
+        for handles in loaded_handles:
+            for layer,h in handles.items():
+                h.remove()
     else:
         save_dict = {
             "model_state_dict": model.state_dict(),
