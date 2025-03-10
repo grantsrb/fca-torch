@@ -48,7 +48,8 @@ class FunctionalComponentAnalysis(nn.Module):
         """
         for vec in new_vectors:
             self.orthogonalization_vectors.append( vec.data )
-        self.max_rank = self.max_rank - len(new_vectors)
+        rank_diff = self.size-len(self.orthogonalization_vectors)
+        self.max_rank = min(self.max_rank, rank_diff)
         print("New Max Rank:", self.max_rank)
 
     def freeze_parameters(self, freeze=True):
@@ -210,37 +211,67 @@ class FunctionalComponentAnalysis(nn.Module):
             x, self.make_matrix(components=components).T
         )
 
-def load_fcas(model, config):
+def load_fcas_from_path(file_path):
+    fca_checkpoint = torch.load(file_path)
+    fca_config = fca_checkpoint["config"]
+    state_dicts = fca_checkpoint["fca_state_dicts"]
+    fcas = {}
+    kwargs = fca_config.get("fca_params", {})
+    for layer in fca_config["fca_layers"]:
+        sd = state_dicts[layer]
+        kwargs["size"] = sd[list(sd.keys())[0]].shape[0]
+        fcas[layer] = FunctionalComponentAnalysis( **kwargs )
+        fcas[layer].load_sd(sd)
+        fcas[layer].update_parameters()
+        fcas[layer].freeze_parameters()
+        fcas[layer].set_fixed(True)
+    return fcas
+    
+def load_fcas(model, load_path, remove_components=True, verbose=False):
     """
     Simplifies the recursive loading of previous fcas.
     """
-    device = model.get_device()
-    fca_checkpoint = torch.load(config["fca_load_path"])
+    device = "cpu" if model is None else model.get_device()
+    if verbose:
+        print("Loading:", load_path)
+    fca_checkpoint = torch.load(load_path)
     fca_config = fca_checkpoint["config"]
+    
     fcas = {}
+    handles = {}
     loaded_fcas = []
     loaded_handles = []
     if fca_config.get("fca_load_path", None) is not None:
         loaded_fcas, loaded_handles = load_fcas(
-            model=model, config=fca_config)
+            model=model,
+            load_path=fca_config["fca_load_path"],
+            remove_components=remove_components,
+            verbose=verbose,
+        )
     state_dicts = fca_checkpoint["fca_state_dicts"]
     kwargs = fca_config.get("fca_params", {})
-    for layer,modu in model.named_modules():
-        if layer in fca_config["fca_layers"]:
-            kwargs["size"] = modu.weight.shape[0]
-            kwargs["remove_components"] = True
-            fcas[layer] = FunctionalComponentAnalysis(
-                **kwargs
-            )
-            fcas[layer].load_sd(state_dicts[layer])
-            fcas[layer].update_parameters()
-            fcas[layer].freeze_parameters()
-            fcas[layer].set_fixed(True)
-            fcas[layer].to(device)
-            h = modu.register_forward_hook(
+    modules = {}
+    if model is not None:
+        for layer,modu in model.named_modules():
+            modules[layer] = modu
+    for layer in state_dicts:
+        sd = state_dicts[layer]
+        kwargs["size"] = sd[list(sd.keys())[0]].shape[0]
+        kwargs["remove_components"] = remove_components
+        print("Remove Out:", remove_components)
+        fcas[layer] = FunctionalComponentAnalysis( **kwargs )
+        fcas[layer].load_sd(sd)
+        fcas[layer].update_parameters()
+        fcas[layer].freeze_parameters()
+        fcas[layer].set_fixed(True)
+        fcas[layer].to(device)
+        if model is not None and layer in modules:
+            h = modules[layer].register_forward_hook(
                 fcas[layer].get_forward_hook()
             )
-            loaded_handles.append(h)
+            handles[layer] = h
+            print("adding handle:")
+    loaded_handles.append(handles)
     loaded_fcas.append(fcas)
     return loaded_fcas, loaded_handles
 
@@ -249,6 +280,7 @@ def initialize_fcas(model, config, loaded_fcas=[]):
     fca_handles = []
     fca_parameters = []
     fcas = {}
+    handles = {}
     fca_layers = config["fca_layers"]
     kwargs = config.get("fca_params", {})
     for name,modu in model.named_modules():
@@ -262,24 +294,23 @@ def initialize_fcas(model, config, loaded_fcas=[]):
                 if loaded_fcas:
                     for loaded in loaded_fcas:
                         if name in loaded:
+                            print("Loading Orthogonalization Vectors", name)
                             fcas[name].add_orthogonalization_vectors(
                                 loaded[name].parameters_list)
             h = modu.register_forward_hook(
                 fcas[name].get_forward_hook()
             )
-            fca_handles.append(h)
+            handles[name] = h
             fca_parameters += list(fcas[name].parameters())
-    return fcas, fca_handles, fca_parameters
+    return fcas, handles, fca_parameters
     
 
 # Example usage
 if __name__ == "__main__":
     n_dim = 5
     fca = FunctionalComponentAnalysis(size=n_dim)
-    print("Params:", fca.parameters_list)
     for i in range(n_dim):
         fca.add_new_axis_parameter()
-        print("Params:", fca.parameters_list)
 
     # Assert that the vectors are orthogonal
     fca.update_parameters()
@@ -287,13 +318,32 @@ if __name__ == "__main__":
         for j in range(i):
             assert torch.dot(fca.parameters_list[i], fca.parameters_list[j]) < 1e-6
     print("Rank:", fca.rank)
-    vec = torch.randn(n_dim)
-    mtx = fca.make_matrix()
-    rot = torch.matmul(vec, mtx)
-    new_vec = torch.matmul(rot, mtx.T)
+    vec = torch.randn(1,n_dim)
+    mtx = fca.weight[:3]
+    rot = torch.matmul(vec, mtx.T)
+    new_vec = torch.matmul(rot, mtx)
+    diff = vec - new_vec
+    zero = torch.matmul(diff, mtx.T)
+
     print("Old Vec:", vec)
     print("New Vec:", new_vec)
+    print("Diff:", diff)
+    print("Zero:", zero)
     print("MSE:", ((vec-new_vec)**2).sum())
+    print()
+
+    mtx = fca.weight[3:]
+    rot = torch.matmul(vec, mtx.T)
+    nnew_vec = torch.matmul(rot, mtx)
+    ddiff = vec - nnew_vec
+    zzero = torch.matmul(ddiff, mtx.T)
+
+    print("Old Vec:", vec)
+    print("New Vec:", nnew_vec)
+    print("Diff:", ddiff)
+    print("Zero:", zzero)
+    print("MSE:", ((vec-new_vec-nnew_vec)**2).sum())
+    print()
     
     rot = fca(vec)
     new_vec = fca(rot, inverse=True)
