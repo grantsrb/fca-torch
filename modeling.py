@@ -71,7 +71,7 @@ class NeuralNetwork(nn.Module):
                 p.requires_grad = False
             except: pass
 
-    def forward(self, x):
+    def forward(self, x, *args, **kwargs):
         x = self.embedding(x).reshape(x.size(0), -1)
         x = self.hidden_layers(x)
         return x
