@@ -139,6 +139,7 @@ def collect_activations(
             "layer_name": torch tensor (N, ...)
     """
     if comms_dict is None: comms_dict = dict()
+    if layers is None: layers = []
 
     # Layers is modified to only the layers that were found in the model.
     # If you argue a layer not found in the model, it will be ignored.
@@ -209,7 +210,8 @@ def collect_activations(
                     #output = torch.cat(output, dim=1)
             outputs[k].append(output)
             comms_dict[k] = []
-    if len(outputs[layers[0]])>1:
+    k = list(outputs.keys())[0]
+    if len(outputs[k])>1:
         # Concat batches together
         outputs = {k:torch.cat(v,dim=0) for k,v in outputs.items()}
     else:

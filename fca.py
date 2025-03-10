@@ -17,7 +17,11 @@ class FunctionalComponentAnalysis(nn.Module):
     components and train each while keeping the previous components frozen.
     This process can be repeated to learn as many components as desired.
     """
-    def __init__(self, size, max_rank=None, remove_components=False):
+    def __init__(self,
+                 size,
+                 max_rank=None,
+                 remove_components=False,
+                 initialization_vector=None,):
         """
         Args:
             size: int
@@ -28,15 +32,18 @@ class FunctionalComponentAnalysis(nn.Module):
             remove_components: bool
                 If True, the model will remove components from
                 the vectors in the forward hook.
+            initialization_vector: optional tensor
+                optionally initialize all new parameters from the
+                same initialization_vector
         """
-        super(FunctionalComponentAnalysis, self).__init__()
+        super().__init__()
         # Sample a single, initial vector and normalize it
         self.size = size
         self.max_rank = max_rank if max_rank is not None else size
         self.remove_components = remove_components
-        initial_vector = torch.randn(size)
-        initial_vector = initial_vector / torch.norm(initial_vector)
-        self.parameters_list = nn.ParameterList([nn.Parameter(initial_vector)])
+        self.initialization_vector = initialization_vector
+        self.parameters_list = nn.ParameterList([])
+        self.add_new_axis_parameter()
         self.is_fixed = False
         self.fixed_weight = None
         self.orthogonalization_vectors = []
@@ -92,7 +99,7 @@ class FunctionalComponentAnalysis(nn.Module):
         with torch.no_grad():
             for p in self.parameters_list:
                 p = self.orthogonalize_vector(
-                    p, prev_vectors=params+self.orthogonalization_vectors)
+                    p, prev_vectors=self.orthogonalization_vectors + params)
                 params.append(p)
         self.parameters_list = nn.ParameterList([
             nn.Parameter(p.data) for p in params
@@ -111,7 +118,7 @@ class FunctionalComponentAnalysis(nn.Module):
         for p in self.parameters_list:
             if p.requires_grad:
                 p = self.orthogonalize_vector(
-                    p, prev_vectors=params+self.orthogonalization_vectors)
+                    p, prev_vectors=self.orthogonalization_vectors + params)
             params.append(p)
         return params
 
@@ -147,14 +154,19 @@ class FunctionalComponentAnalysis(nn.Module):
         return len(self.parameters_list)
 
     def get_device(self):
-        device = self.parameters_list[0].get_device()
+        try:
+            device = self.parameters_list[0].get_device()
+        except: device = -1
         return "cpu" if device<0 else device
 
     def add_new_axis_parameter(self):
         if len(self.parameters_list) >= self.max_rank:
             return None
         # Sample a new axis and add it to the parameter list
-        new_axis = torch.randn(self.parameters_list[0].shape[0])
+        if self.initialization_vector is not None:
+            new_axis = self.initialization_vector.data.clone()
+        else:
+            new_axis = torch.randn(self.size)
         p = nn.Parameter(new_axis).to(self.get_device())
         self.parameters_list.append(p)
         return self.parameters_list[-1]
@@ -192,6 +204,25 @@ class FunctionalComponentAnalysis(nn.Module):
         self.freeze_parameters(freeze=freeze_params)
         p = self.add_new_axis_parameter()
         return p
+    
+    def add_params_from_vector_list(self, vec_list, overwrite=True):
+        """
+        Adds each of the vectors in the vec_list to the parameters without
+        orthogonalizing them.
+        
+        Args:
+            vec_list: list of torch tensors [(S,), ...]
+            overwrite: bool
+                if true, will overwrite existing parameters before adding new
+                ones. Otherwise only initializes new vectors.
+        """
+        device = self.get_device()
+        for i,vec in enumerate(vec_list):
+            if overwrite and i<len(self.parameters_list):
+                p = self.parameters_list[i]
+            else:
+                p = self.add_new_axis_parameter()
+            p.data = vec.data.clone().to(device)
 
     def get_forward_hook(self):
         def hook(module, input, output):
