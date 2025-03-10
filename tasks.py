@@ -128,6 +128,9 @@ def get_dataset(config):
 
 class HierarchicalLogicalTask(Dataset):
     def __init__(self, config):
+        config["n_pairs"]  = config.get("n_pairs", 4)
+        config["n_samples"]  = config.get("n_samples", 1000)
+        config["operations"] = config.get("operations", None)
         self.batch_size = config.get("batch_size", 128)
         self.data, self.operations = get_dataset(config)
         self.operation_names = [
@@ -164,7 +167,7 @@ class HierarchicalLogicalTask(Dataset):
     def n_batches(self, batch_size=None):
         if batch_size is None:
             batch_size = self.batch_size
-        return len(self) // batch_size
+        return max(len(self) // batch_size, 1)
 
     def __getitem__(self, idx):
         return self.data["input_ids"][idx], self.data["output_ids"][idx]
