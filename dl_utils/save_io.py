@@ -5,6 +5,8 @@ import json
 import yaml
 from .utils import get_git_revision_hash, package_versions, get_datetime_str
 import numpy as np
+import warnings
+warnings.filterwarnings('ignore')
 
 def save_checkpt(save_dict,
         save_folder,
@@ -661,10 +663,11 @@ def get_save_folder(config, name_keys=[], mkdirs=True, ret_model_folder=False):
     exp_num = get_new_exp_num(exp_folder, exp_name)
     model_folder = f"{exp_name}_{exp_num}"
     if name_keys:
-        model_folder = get_save_identifier(
-            save_folder=model_folder,
-            config={k:config[k] for k in name_keys},
-            defaults=config)
+        model_folder += "_"+get_save_identifier(
+            config=config,
+            save_keys=name_keys,
+            save_folder=exp_folder, 
+        )
     save_folder = os.path.join(exp_folder, model_folder)
     if mkdirs:
         os.makedirs(save_folder, exist_ok=True)
@@ -744,9 +747,9 @@ def get_num_duplicates(folder, fname, sep="_v"):
     return n_dupls
 
 def get_save_identifier(
-        save_folder,
         config,
-        defaults,
+        save_keys,
+        save_folder=None,
         abbrevs = {},
         ignores = {
             "print_every",
@@ -756,11 +759,14 @@ def get_save_identifier(
             "model_load_path",
             "fca_params",
             "persistent_keys",
+            "exp_name",
         },):
     """
     Args:
         config: dict
             the keys you want to use first for identification
+        save_keys: list of str
+            the keys to use to create the save id
     """
     abbrevs = {
         **abbrevs,
@@ -776,18 +782,11 @@ def get_save_identifier(
         "relaxed": "rlxd",
     }
     # add key value pairs to folder name
-    if "save_keys" in config:
-        s = set(config["save_keys"])
-    else:
-        s = set(config.keys())
-        d = set(config.keys()) - set(defaults.keys())
-        if len(s)==0 or len(d)==0: s = defaults.get("save_keys", set())
+    if save_keys is None:
+        save_keys = config["save_keys"]
 
-    if len(s)==0:
-        sep = "_v"
-        n_dupls = get_num_duplicates(folder=save_folder,fname=save_name,sep=sep)
-        return save_name + f"{sep}{n_dupls}"
-    for k in sorted(list(s)):
+    save_name = ""
+    for k in sorted(list(save_keys)):
         if k in ignores: continue
         has_len = hasattr(config[k],"__len__")
         if type(config[k])!=str and has_len:
@@ -803,8 +802,9 @@ def get_save_identifier(
                 val = c.split("/")[-1][:5]
         save_name += abbrevs.get(k, k).replace("_","")[:7]+val+"_"
     save_name = save_name[:-1]
-    for k,v in abbrevs:
+    for k,v in abbrevs.items():
         save_name = save_name.replace(k,v)
-    n_dupls = get_num_duplicates(save_folder, save_name)
-    return save_name + f"_v{n_dupls}"
-    
+    if save_folder:
+        n_dupls = get_num_duplicates(save_folder, save_name)
+        save_name = save_name + f"_v{n_dupls}"
+    return save_name

@@ -29,6 +29,24 @@ def try_key(d, key, val):
 def get_datetime_str():
     return datetime.now().strftime("%d/%m/%Y %H:%M:%S")
 
+def pretty_print_config(config, n_tab=1):
+    print(pretty_string(config, n_tab=n_tab))
+
+def pretty_string(config, n_tab=1):
+    string = ""
+    keys = sorted(config.keys())
+    tabs = "\t"*n_tab
+    for k in keys:
+        title = tabs+"\""+str(k)+"\""+":"
+        if type(config[k])==dict:
+            title += " {\n"
+            body = pretty_string(config[k], n_tab=n_tab+1) + "\n"+tabs+"}"
+        else:
+            title += " "
+            body = str(config[k])
+        string += f"{title}{body}\n"
+    return string[:-1]
+
 def resize2Square(img, size):
     """
     resizes image to a square with the argued size. Preserves the aspect
@@ -1076,16 +1094,12 @@ def rolling_window(array, window, time_axis=0):
 
 
 if __name__=="__main__":
-    shape = (5,6)
-    sz = 10
-    k = 4
-    for i in range(3):
-        window = k+i
-        mask = generate_ktoken_causal_mask(
-            sz=sz, k=window, dtype="float"
-        )
-        print("sz:", sz)
-        print("k:", window)
-        print(mask)
-        print(mask.long())
-        print()
+    config = {
+        "foo": [1,2,3],
+        "shoo": {
+            "do": ["r"],
+            "don": 4,
+        },
+        "poo": "ew",
+    }
+    pretty_print_config(config)
