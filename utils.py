@@ -86,7 +86,7 @@ def register_activation_hooks(
 
 def collect_activations(
         model,
-        input_ids,
+        input_data,
         attention_mask=None,
         pad_mask=None,
         task_mask=None,
@@ -105,7 +105,7 @@ def collect_activations(
 
     Args:
         model: torch Module or torch gpu Module
-        input_ids: long tensor (N,S)
+        input_data: float tensor or long tensor (N,...)
         pad_mask: bool tensor (N,S)
             true means padding
         task_mask: bool tensor (N,S)
@@ -147,18 +147,18 @@ def collect_activations(
     handles, layers = register_activation_hooks(
         model=model, layers=layers, comms_dict=comms_dict, to_cpu=to_cpu,)
 
-    if batch_size is None: batch_size = len(input_ids)
+    if batch_size is None: batch_size = len(input_data)
 
     device = device_fxn(next(model.parameters()).get_device())
     outputs = {key:[] for key in layers}
     if ret_attns:
-        assert len(input_ids)<=batch_size
+        assert len(input_data)<=batch_size
         outputs["attentions"] = []
     if ret_pred_ids: outputs["pred_ids"] = []
-    rnge = range(0,len(input_ids), batch_size)
+    rnge = range(0,len(input_data), batch_size)
     if verbose: rnge = tqdm(rnge)
     for batch in rnge:
-        x = input_ids[batch:batch+batch_size]
+        x = input_data[batch:batch+batch_size]
         amask = None
         pmask = None
         tmask = None
@@ -170,7 +170,7 @@ def collect_activations(
             tmask = task_mask[batch:batch+batch_size].to(device)
         try:
             out_dict = model(
-                inpts=x.to(device),
+                x.to(device),
                 task_mask=tmask,
                 pad_mask=pmask,
                 output_attentions=ret_attns,
@@ -178,17 +178,20 @@ def collect_activations(
                 ret_gtruth=ret_gtruth,
                 tforce=tforce,)
         except:
+            # Huggingface models
             out_dict = model(
                 input_ids=x.to(device),
                 attention_mask=amask if amask is not None else pmask,
                 output_attentions=ret_attns,)
-        if ret_attns:
+        if ret_attns and type(out_dict)!=torch.Tensor:
             outputs["attentions"].append(out_dict["attentions"][0])
         if ret_pred_ids:
-            if "pred_ids" in out_dict:
+            if type(out_dict)!=torch.Tensor and "pred_ids" in out_dict:
                 outputs["pred_ids"].append(out_dict["pred_ids"])
-            else:
+            elif hasattr(out_dict, "logits"):
                 outputs["pred_ids"].append(torch.argmax(out_dict.logits, dim=-1))
+            else:
+                outputs["pred_ids"].append(torch.argmax(out_dict, dim=-1))
         for k in layers:
             output = comms_dict[k]
             if type(output)==list: # There could be an internal for loop in model
