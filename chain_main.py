@@ -99,18 +99,19 @@ if __name__ == "__main__":
         data_dict["val_loss"].append(metrics["val_loss"])
         data_dict["rank"].append(new_rank)
         data_dict["cumu_rank"].append(cumu_rank)
-        print("Exec Time:", time.time()-startt)
 
-    save_path = os.path.join(
-        get_folder_from_path(config["model_load_path"]),
-        "chain_results.csv",
-    )
-    df = pd.DataFrame(data_dict)
-    print("DataFrame:")
-    print(df)
-    print("Model Path:", config["model_load_path"])
-    if len(df)>0:
-        print("Saving to", save_path)
-        df.to_csv(save_path, header=True, index=False)
+        save_path = os.path.join(
+            get_folder_from_path(config["model_load_path"]),
+            "chain_results.csv",
+        )
+        df = pd.DataFrame(data_dict)
+        print("DataFrame:")
+        print(df)
+        print("Model Path:", config["model_load_path"])
+        if len(df)>0:
+            print("Saving to", save_path)
+            df.to_csv(save_path, header=True, index=False)
+
+        print("Exec Time:", time.time()-startt)
     print("Finished FCA Chain")
     print("----")
