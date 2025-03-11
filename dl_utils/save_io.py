@@ -208,6 +208,7 @@ def is_model_folder(path, exp_name=None, incl_empty=True):
     for content in contents:
         if ".pt" in content: is_empty = False
         if "hyperparams" in content: has_hyps = True
+        if "config" in content: has_hyps = True
     if incl_empty: return has_hyps or not is_empty
     return not is_empty
 
@@ -255,7 +256,8 @@ def is_exp_folder(path):
 def get_model_folders(exp_folder, incl_full_path=False, incl_empty=True):
     """
     Returns a list of paths to the model folders contained within the
-    argued exp_folder
+    argued exp_folder. A model folder is defined by the is_model_folder
+    function.
 
     exp_folder - str
         full path to experiment folder
