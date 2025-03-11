@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import numpy as np
 
 class FunctionalComponentAnalysis(nn.Module):
     """
@@ -67,9 +68,10 @@ class FunctionalComponentAnalysis(nn.Module):
             self.orthogonalization_mtx = []
             self.ortho_cov_mtx = []
             return
-        self.orthogonalization_mtx = torch.vstack(
-            self.excl_ortho_list+self.fixed_list
-        )
+        device = self.get_device()
+        vecs = [p.data.to(device) for p in self.excl_ortho_list] +\
+               [p.data.to(device) for p in self.fixed_list]
+        self.orthogonalization_mtx = torch.vstack( vecs )
         self.ortho_cov_mtx = torch.matmul(
             self.orthogonalization_mtx.T, self.orthogonalization_mtx
         )
@@ -94,9 +96,9 @@ class FunctionalComponentAnalysis(nn.Module):
         fixed_list = []
         train_list = []
         for p in self.parameters_list:
-            p.requires_grad = freeze
+            p.requires_grad = not freeze
             if freeze:
-                fixed_list.append(p.data.clone())
+                fixed_list.append(p)
             else:
                 train_list.append(p)
         self.train_list = train_list
@@ -150,6 +152,8 @@ class FunctionalComponentAnalysis(nn.Module):
         self.parameters_list = nn.ParameterList([
             nn.Parameter(p.data) for p in params
         ])
+        self.train_list = [p for p in self.parameters_list if p.requires_grad]
+        self.fixed_list = [p for p in self.parameters_list if not p.requires_grad]
         self.update_orthogonalization_mtx()
 
     def orthogonalize_parameters(self):
@@ -167,8 +171,8 @@ class FunctionalComponentAnalysis(nn.Module):
             orth = []
             cov_mtx = []
         params = []
-        for i,p in enumerate(self.train_list):
-            if p.requires_grad:
+        for i,p in enumerate(self.parameters_list):
+            if p.requires_grad==True:
                 if len(params)==0 and len(cov_mtx)>0:
                     p = self.orthogonalize_vector(
                         p,
@@ -185,7 +189,7 @@ class FunctionalComponentAnalysis(nn.Module):
                         p,
                         prev_vectors=params
                     )
-            params.append(p)
+                params.append(p)
         return self.fixed_list + params
 
     def make_matrix(self, components=None):
