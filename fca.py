@@ -21,7 +21,9 @@ class FunctionalComponentAnalysis(nn.Module):
                  size,
                  max_rank=None,
                  remove_components=False,
-                 initialization_vector=None,):
+                 initialization_vector=None,
+                 component_mask=None,
+                 *args, **kwargs):
         """
         Args:
             size: int
@@ -35,6 +37,9 @@ class FunctionalComponentAnalysis(nn.Module):
             initialization_vector: optional tensor
                 optionally initialize all new parameters from the
                 same initialization_vector
+            component_mask: tensor
+                optionally argue a mask or index tensor to select
+                specific components when constructing the matrix
         """
         super().__init__()
         # Sample a single, initial vector and normalize it
@@ -42,6 +47,7 @@ class FunctionalComponentAnalysis(nn.Module):
         self.max_rank = max_rank if max_rank is not None else size
         self.remove_components = remove_components
         self.initialization_vector = initialization_vector
+        self.component_mask = component_mask
         self.parameters_list = nn.ParameterList([])
         self.add_new_axis_parameter()
         self.is_fixed = False
@@ -53,8 +59,10 @@ class FunctionalComponentAnalysis(nn.Module):
         Args:
             new_vectors: list of tensors
         """
-        for vec in new_vectors:
-            self.orthogonalization_vectors.append( vec.data )
+        self.orthogonalization_vectors = torch.cat(
+            [self.orthogonalization_vectors]+[v for v in new_vectors],
+            dim=0
+        )
         rank_diff = self.size-len(self.orthogonalization_vectors)
         self.max_rank = min(self.max_rank, rank_diff)
         print("New Max Rank:", self.max_rank)
@@ -76,13 +84,18 @@ class FunctionalComponentAnalysis(nn.Module):
         self.is_fixed = fixed
 
     def orthogonalize_vector(self, new_vector, prev_vectors):
-        # Make the new vector orthogonal to all previous vectors using Gram-Schmidt process
-        for param in prev_vectors:
-            projection = torch.dot(new_vector, param) * param
-            new_vector = new_vector - projection
-        # Normalize the new vector
+        mtx = prev_vectors
+        if mtx is not None and len(mtx)>0:
+            if type(mtx)==list:
+                # Make matrix of previous vectors
+                mtx = torch.vstack(mtx)
+            # Compute projections
+            projections = torch.matmul(mtx, new_vector)
+            # Subtract projections
+            proj_sum = torch.matmul(mtx.T, projections)
+            new_vector = new_vector - proj_sum
+        # Normalize vector
         new_vector = new_vector / torch.norm(new_vector, 2)
-        # Store the new vector as a parameter
         return new_vector
 
     def update_parameters(self):
@@ -92,14 +105,14 @@ class FunctionalComponentAnalysis(nn.Module):
         """
         # Sample a new vector and orthogonalize it
         device = self.get_device()
-        self.orthogonalization_vectors = [
-            v.to(device) for v in self.orthogonalization_vectors
-        ]
+        orth = self.orthogonalization_vectors
+        if len(orth)>0:
+            orth = orth.to(device)
         params = []
         with torch.no_grad():
             for p in self.parameters_list:
                 p = self.orthogonalize_vector(
-                    p, prev_vectors=self.orthogonalization_vectors + params)
+                    p, prev_vectors=[orth]+params)
                 params.append(p)
         self.parameters_list = nn.ParameterList([
             nn.Parameter(p.data) for p in params
@@ -111,14 +124,16 @@ class FunctionalComponentAnalysis(nn.Module):
         Does track gradients.
         """
         device = self.get_device()
-        self.orthogonalization_vectors = [
-            v.to(device) for v in self.orthogonalization_vectors
-        ]
+        orth = self.orthogonalization_vectors
+        if len(orth)>0: orth = orth.to(device)
         params = []
         for p in self.parameters_list:
             if p.requires_grad:
-                p = self.orthogonalize_vector(
-                    p, prev_vectors=self.orthogonalization_vectors + params)
+                if len(params)==0:
+                    prev_vectors = orth
+                else:
+                    prev_vectors = [orth] + params
+                p = self.orthogonalize_vector(p, prev_vectors=prev_vectors)
             params.append(p)
         return params
 
@@ -143,6 +158,8 @@ class FunctionalComponentAnalysis(nn.Module):
             matrix = torch.vstack(params)
         if components is not None:
             matrix = matrix[components]
+        elif self.component_mask is not None:
+            matrix = matrix[self.component_mask]
         return matrix
 
     @property
@@ -170,6 +187,17 @@ class FunctionalComponentAnalysis(nn.Module):
         p = nn.Parameter(new_axis).to(self.get_device())
         self.parameters_list.append(p)
         return self.parameters_list[-1]
+
+    def add_component(self):
+        self.add_new_axis_parameter()
+
+    def remove_component(self, idx):
+        was_fixed = self.is_fixed
+        if self.is_fixed: self.set_fixed(False)
+        del_p = self.parameters_list[idx]
+        new_list = [p for p in self.parameters_list if p is not del_p]
+        self.parameters_list = nn.ParameterList(new_list)
+        if was_fixed: self.set_fixed(True)
 
     def load_sd(self, sd):
         """
@@ -338,10 +366,43 @@ def initialize_fcas(model, config, loaded_fcas=[]):
 
 # Example usage
 if __name__ == "__main__":
-    n_dim = 5
+
+    n_dim = 512
     fca = FunctionalComponentAnalysis(size=n_dim)
     for i in range(n_dim):
         fca.add_new_axis_parameter()
+
+    import time
+
+    print("Fast:")
+    start = time.time()
+    fast_params = []
+    for p in fca.parameters_list:
+        p = fca.orthogonalize_vector(p, prev_vectors=fast_params)
+        fast_params.append(p)
+    print("Time:", time.time()-start)
+
+    print("Fast:")
+    start = time.time()
+    p = fca.orthogonalize_vector(fca.parameters_list[-1], prev_vectors=fast_params[:-1])
+    print("Time:", time.time()-start)
+
+    mtx = torch.vstack(fast_params)
+    print("Mtx:")
+    start = time.time()
+    p = fca.orthogonalize_vector(fca.parameters_list[-1], prev_vectors=mtx[:-1])
+    print("Time:", time.time()-start)
+
+    for op,fp in zip(mtx_params,fast_params):
+        mse = ((op-fp)**2).mean()
+        if mse>1e-6:
+            print("OP:", op[:5])
+            print("FP:", fp[:5])
+            print("MSE:", mse)
+            print()
+
+    print("End Fast Comparison")
+
 
     # Assert that the vectors are orthogonal
     fca.update_parameters()
