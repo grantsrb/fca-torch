@@ -68,7 +68,7 @@ class FunctionalComponentAnalysis(nn.Module):
             self.ortho_cov_mtx = []
             return
         self.orthogonalization_mtx = torch.vstack(
-            [self.excl_ortho_list]+self.fixed_list
+            self.excl_ortho_list+self.fixed_list
         )
         self.ortho_cov_mtx = torch.matmul(
             self.orthogonalization_mtx.T, self.orthogonalization_mtx
@@ -140,12 +140,12 @@ class FunctionalComponentAnalysis(nn.Module):
         # Sample a new vector and orthogonalize it
         device = self.get_device()
         orth = self.excl_ortho_list
-        if len(orth)>0: orth = orth.to(device)
+        if len(orth)>0: orth = [o.to(device) for o in orth]
         params = []
         with torch.no_grad():
             for p in self.parameters_list:
                 p = self.orthogonalize_vector(
-                    p, prev_vectors=[orth]+params)
+                    p, prev_vectors=orth+params)
                 params.append(p)
         self.parameters_list = nn.ParameterList([
             nn.Parameter(p.data) for p in params
