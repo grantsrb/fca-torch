@@ -10,7 +10,7 @@ import time
 import warnings
 warnings.filterwarnings('ignore')
 
-from dl_utils.save_io import record_session, load_checkpoint
+from dl_utils.save_io import record_session, load_checkpoint, get_folder_from_path
 from dl_utils.utils import pretty_print_config
 
 class PlateauTracker:
@@ -47,6 +47,9 @@ def train(config, device=None):
             **copy.deepcopy(config),
             **copy.deepcopy(checkpoint['config'])
         }
+        if config.get("save_to_load_path", True):
+            conf["save_folder"] = get_folder_from_path(
+                config["model_load_path"])
         for k in config.get("persistent_keys", []):
             if k in config:
                 conf[k] = config[k]
