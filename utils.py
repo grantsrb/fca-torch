@@ -6,6 +6,7 @@ import sys
 import os
 from tqdm import tqdm
 import copy
+from sklearn.utils.extmath import randomized_svd
 
 def device_fxn(device):
     if device<0: return "cpu"
@@ -400,3 +401,75 @@ def extract_ids(string, tokenizer):
     if ids[-1]==tokenizer.eos_token_id and len(ids)>1:
         ids = ids[:-1]
     return ids
+
+def perform_pca(
+        X,
+        n_components=None,
+        scale=True,
+        transform_data=False,
+        full_matrices=False,
+        randomized=False):
+    """
+    Perform PCA on the data matrix X
+
+    Args:
+        X: tensor (M,N)
+        n_components: int
+            optionally specify the number of components
+        scale: bool
+            if true, will scale the data along each column
+        transform_data: bool
+            if true, will compute and return the transformed
+            data
+        full_matrices: bool
+            determines if U will be returned as a square.
+        randomized: bool
+            if true, will use randomized svd for faster
+            computations
+    """
+    if n_components is None:
+        n_components = X.shape[-1]
+        
+    svd_kwargs = {}
+    if type(X)==torch.Tensor:
+        if randomized:
+            svd_kwargs["q"] = n_components
+            svd = torch.svd_lowrank
+        else:
+            svd_kwargs["full_matrices"] = full_matrices
+            svd = torch.linalg.svd
+    elif type(X)==np.ndarray:
+        if randomized:
+            svd_kwargs["n_components"] = n_components
+            svd = randomized_svd
+        else:
+            svd_kwargs["n_components"] = n_components
+            svd_kwargs["compute_uv"] = True
+            svd = np.linalg.svd
+    assert not n_components or X.shape[-1]>=n_components
+    # Center the data by subtracting the mean along each feature (column)
+    X_centered = X - X.mean(dim=0, keepdim=True)
+    if scale: X_centered = X_centered/(X_centered.std(0)+1e-6)
+    
+    # Compute the SVD of the centered data
+    # X_centered = U @ diag(S) @ Vh, where Vh contains the principal components as its rows
+    U, S, Vh = svd(X_centered, **svd_kwargs)
+    
+    # The principal components (eigenvectors) are the first n_components rows of Vh
+    components = Vh[:n_components]
+    
+    # Explained variance for each component can be computed from the singular values
+    explained_variance = (S[:n_components] ** 2) / (X.shape[0] - 1)
+    prop_explained_variance = explained_variance/explained_variance.sum()
+    
+    ret_dict = {
+        "components": components,
+        "explained_variance": explained_variance,
+        "prop_explained_variance": prop_explained_variance,
+    }
+    if transform_data:
+        # Project the data onto the principal components
+        # Note: components.T has shape (features, n_components)
+        ret_dict["transformed_X"] = X_centered @ components.T
+
+    return ret_dict
