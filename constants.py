@@ -18,7 +18,7 @@ DEFAULTS = {
         'lnorm': True,
     },
     'lr': 0.001,
-    'num_epochs': 100000,
+    'num_epochs': 1000000,
     'batch_size': 128,
     "patience": 100,
     "plateau": 0.005,
