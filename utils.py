@@ -406,6 +406,7 @@ def perform_pca(
         X,
         n_components=None,
         scale=True,
+        center=True,
         transform_data=False,
         full_matrices=False,
         randomized=False):
@@ -448,12 +449,19 @@ def perform_pca(
             svd = np.linalg.svd
     assert not n_components or X.shape[-1]>=n_components
     # Center the data by subtracting the mean along each feature (column)
-    X_centered = X - X.mean(dim=0, keepdim=True)
-    if scale: X_centered = X_centered/(X_centered.std(0)+1e-6)
+    means = torch.zeros_like(X[0])
+    if center:
+        means = X.mean(dim=0, keepdim=True)
+        X = X - means
+    stds = torch.ones_like(X[0])
+    if scale:
+        stds = (X.std(0)+1e-6)
+        X = X/stds
+    
     
     # Compute the SVD of the centered data
-    # X_centered = U @ diag(S) @ Vh, where Vh contains the principal components as its rows
-    U, S, Vh = svd(X_centered, **svd_kwargs)
+    # X = U @ diag(S) @ Vh, where Vh contains the principal components as its rows
+    U, S, Vh = svd(X, **svd_kwargs)
     
     # The principal components (eigenvectors) are the first n_components rows of Vh
     components = Vh[:n_components]
@@ -466,10 +474,12 @@ def perform_pca(
         "components": components,
         "explained_variance": explained_variance,
         "prop_explained_variance": prop_explained_variance,
+        "means": means,
+        "stds": stds,
     }
     if transform_data:
         # Project the data onto the principal components
         # Note: components.T has shape (features, n_components)
-        ret_dict["transformed_X"] = X_centered @ components.T
+        ret_dict["transformed_X"] = X @ components.T
 
     return ret_dict
