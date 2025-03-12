@@ -24,6 +24,8 @@ class FunctionalComponentAnalysis(nn.Module):
                  remove_components=False,
                  initialization_vector=None,
                  component_mask=None,
+                 means=None,
+                 stds=None,
                  *args, **kwargs):
         """
         Args:
@@ -41,6 +43,12 @@ class FunctionalComponentAnalysis(nn.Module):
             component_mask: tensor
                 optionally argue a mask or index tensor to select
                 specific components when constructing the matrix
+            means: None or tensor (S,)
+                optionally specify a tensor that will be used to
+                center the representations before the FCA
+            stds: None or tensor (S,)
+                optionally specify a tensor that will be used to
+                scale the representations before the FCA
         """
         super().__init__()
         # Sample a single, initial vector and normalize it
@@ -49,6 +57,8 @@ class FunctionalComponentAnalysis(nn.Module):
         self.remove_components = remove_components
         self.initialization_vector = initialization_vector
         self.component_mask = component_mask
+        self.set_means(means)
+        self.set_stds(stds)
         self.parameters_list = nn.ParameterList([])
         self.train_list = []
         self.fixed_list = []
@@ -57,6 +67,12 @@ class FunctionalComponentAnalysis(nn.Module):
         self.is_fixed = False
         self.fixed_weight = None
         self.excl_ortho_list = []
+
+    def set_means(self, means):
+        self.register_buffer("means", means)
+
+    def set_stds(self, stds):
+        self.register_buffer("stds", stds)
 
     def update_orthogonalization_mtx(self):
         """
@@ -314,18 +330,33 @@ class FunctionalComponentAnalysis(nn.Module):
 
     def get_forward_hook(self):
         def hook(module, input, output):
-            fca_vec = self.forward(output)
-            stripped = self.forward(fca_vec, inverse=True)
+            fca_vec = self(output)
+            stripped = self(fca_vec, inverse=True)
             if self.remove_components:
                 stripped = output - stripped
             return stripped
         return hook
+    
+    def hook_model_layer(self, model, layer):
+        for mlayer,modu in model.named_modules():
+            if layer==mlayer:
+                return modu.register_forward_hook(self.get_forward_hook())
+        return None
 
     def forward(self, x, inverse=False, components=None):
         if inverse:
-            return torch.matmul(
+            x = torch.matmul(
                 x, self.make_matrix(components=components)
             )
+            if self.stds is not None:
+                x = x*self.stds
+            if self.means is not None:
+                x = x+self.means
+            return x
+        if self.means is not None:
+            x = x-self.means
+        if self.stds is not None:
+            x = x/self.stds
         return torch.matmul(
             x, self.make_matrix(components=components).T
         )
@@ -346,13 +377,16 @@ def load_fcas_from_path(file_path):
         fcas[layer].set_fixed(True)
     return fcas
     
-def load_fcas(model, load_path, remove_components=True, verbose=False):
+def load_fcas(
+        model,
+        load_path,
+        remove_components=True,
+        ret_paths=False,
+        verbose=False):
     """
     Simplifies the recursive loading of previous fcas.
     """
     device = "cpu" if model is None else model.get_device()
-    if verbose:
-        print("Loading:", load_path)
     fca_checkpoint = torch.load(load_path)
     fca_config = fca_checkpoint["config"]
     
@@ -361,12 +395,19 @@ def load_fcas(model, load_path, remove_components=True, verbose=False):
     loaded_fcas = []
     loaded_handles = []
     if fca_config.get("fca_load_path", None) is not None:
-        loaded_fcas, loaded_handles = load_fcas(
+        ret = load_fcas(
             model=model,
             load_path=fca_config["fca_load_path"],
             remove_components=remove_components,
+            ret_paths=ret_paths,
             verbose=verbose,
         )
+        if ret_paths:
+            loaded_fcas, loaded_handles, loaded_paths = ret
+        else:
+            loaded_fcas, loaded_handles = ret
+    if verbose:
+        print("Loading:", load_path)
     state_dicts = fca_checkpoint["fca_state_dicts"]
     kwargs = fca_config.get("fca_params", {})
     modules = {}
@@ -377,7 +418,6 @@ def load_fcas(model, load_path, remove_components=True, verbose=False):
         sd = state_dicts[layer]
         kwargs["size"] = sd[list(sd.keys())[0]].shape[0]
         kwargs["remove_components"] = remove_components
-        print("Remove Out:", remove_components)
         fcas[layer] = FunctionalComponentAnalysis( **kwargs )
         fcas[layer].load_sd(sd)
         fcas[layer].update_parameters()
@@ -389,7 +429,6 @@ def load_fcas(model, load_path, remove_components=True, verbose=False):
                 fcas[layer].get_forward_hook()
             )
             handles[layer] = h
-            print("adding handle:")
     loaded_handles.append(handles)
     loaded_fcas.append(fcas)
     return loaded_fcas, loaded_handles
