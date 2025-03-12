@@ -108,6 +108,9 @@ class FunctionalComponentAnalysis(nn.Module):
         print("New Max Rank:", self.max_rank)
         self.update_orthogonalization_mtx()
 
+    def add_orthogonalization_vectors(self, new_vectors):
+        self.add_excl_ortho_vectors(new_vectors)
+
     def freeze_parameters(self, freeze=True):
         fixed_list = []
         train_list = []
@@ -288,14 +291,22 @@ class FunctionalComponentAnalysis(nn.Module):
         try:
             self.load_state_dict(sd)
         except:
-            print("Failed to load sd")
-            print("Current sd:")
-            for k in self.state_dict():
-                print(k, self.state_dict()[k].shape)
-            print("Argued sd:")
-            for k in sd:
-                print(k, sd[k].shape)
-            self.load_state_dict(sd)
+            if "means" in sd and not hasattr(self, "means"):
+                self.add_means(sd["means"])
+            if "stds" in sd and not hasattr(self, "stds"):
+                self.add_means(sd["stds"])
+            try:
+                self.load_state_dict(sd)
+            except:
+                print("Failed to load sd")
+                print("Current sd:")
+                for k in self.state_dict():
+                    print(k, self.state_dict()[k].shape)
+                print("Argued sd:")
+                for k in sd:
+                    print(k, sd[k].shape)
+                self.load_state_dict(sd)
+                assert False
 
     def init_from_fca(self, fca, freeze_params=True):
         """
@@ -376,7 +387,7 @@ def load_fcas_from_path(file_path):
         fcas[layer].freeze_parameters()
         fcas[layer].set_fixed(True)
     return fcas
-    
+
 def load_fcas(
         model,
         load_path,
@@ -387,13 +398,19 @@ def load_fcas(
     Simplifies the recursive loading of previous fcas.
     """
     device = "cpu" if model is None else model.get_device()
+
+    # Load Checkpoint
     fca_checkpoint = torch.load(load_path)
     fca_config = fca_checkpoint["config"]
-    
+
+    # Initialize Variables
     fcas = {}
     handles = {}
     loaded_fcas = []
     loaded_handles = []
+    loaded_paths = []
+
+    # Recursively Load Previous FCAs
     if fca_config.get("fca_load_path", None) is not None:
         ret = load_fcas(
             model=model,
@@ -406,21 +423,25 @@ def load_fcas(
             loaded_fcas, loaded_handles, loaded_paths = ret
         else:
             loaded_fcas, loaded_handles = ret
+    loaded_paths.append(load_path)
+
+    # Create the FCAs and Load the SDs
     if verbose:
         print("Loading:", load_path)
     state_dicts = fca_checkpoint["fca_state_dicts"]
     kwargs = fca_config.get("fca_params", {})
     modules = {}
+    # Attach FCA if model is argued
     if model is not None:
         for layer,modu in model.named_modules():
             modules[layer] = modu
+    # Create FCA for each layer
     for layer in state_dicts:
         sd = state_dicts[layer]
         kwargs["size"] = sd[list(sd.keys())[0]].shape[0]
         kwargs["remove_components"] = remove_components
         fcas[layer] = FunctionalComponentAnalysis( **kwargs )
         fcas[layer].load_sd(sd)
-        fcas[layer].update_parameters()
         fcas[layer].freeze_parameters()
         fcas[layer].set_fixed(True)
         fcas[layer].to(device)
@@ -429,11 +450,30 @@ def load_fcas(
                 fcas[layer].get_forward_hook()
             )
             handles[layer] = h
+
     loaded_handles.append(handles)
     loaded_fcas.append(fcas)
+    if ret_paths:
+        return loaded_fcas, loaded_handles, loaded_paths
     return loaded_fcas, loaded_handles
 
-def initialize_fcas(model, config, loaded_fcas=[]):
+def initialize_fcas(model, config, loaded_fcas=[], means=None, stds=None):
+    """
+    Args:
+        model: torch module
+        config: dict
+        loaded_fcas: list of FCA objects
+        means: dict
+            keys: str
+                the layer names
+            vals: torch tensor (S,)
+                the means for that layer
+        stds: dict
+            keys: str
+                the layer names
+            vals: torch tensor (S,)
+                the stds for that layer
+    """
     device = model.get_device()
     fca_handles = []
     fca_parameters = []
@@ -444,6 +484,8 @@ def initialize_fcas(model, config, loaded_fcas=[]):
     for name,modu in model.named_modules():
         if name in fca_layers:
             kwargs["size"] = modu.weight.shape[0]
+            kwargs["means"] = means[name]
+            kwargs["stds"] = stds[name]
             fcas[name] = FunctionalComponentAnalysis(
                 **kwargs
             )

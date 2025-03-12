@@ -156,6 +156,7 @@ def collect_activations(
     if ret_attns:
         assert len(input_data)<=batch_size
         outputs["attentions"] = []
+    outputs["logits"] = []
     if ret_pred_ids: outputs["pred_ids"] = []
     rnge = range(0,len(input_data), batch_size)
     if verbose: rnge = tqdm(rnge)
@@ -189,10 +190,13 @@ def collect_activations(
             outputs["attentions"].append(out_dict["attentions"][0])
         if ret_pred_ids:
             if type(out_dict)!=torch.Tensor and "pred_ids" in out_dict:
+                outputs["logits"].append(out_dict["logits"])
                 outputs["pred_ids"].append(out_dict["pred_ids"])
             elif hasattr(out_dict, "logits"):
+                outputs["logits"].append(out_dict.logits)
                 outputs["pred_ids"].append(torch.argmax(out_dict.logits, dim=-1))
             else:
+                outputs["logits"].append(out_dict)
                 outputs["pred_ids"].append(torch.argmax(out_dict, dim=-1))
         for k in layers:
             output = comms_dict[k]

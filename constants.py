@@ -26,6 +26,9 @@ DEFAULTS = {
     "save_to_load_path": True,
 
     "do_fca": False,
+    "zscore_fca": False, # Will zscore the reps before fca but be careful
+                         # as this will make the resulting vectors non
+                         # orthogonal in the orig activation space
     'fca_load_path': None,
     'fca_params': {
         "max_rank": None
