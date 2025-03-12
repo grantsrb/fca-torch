@@ -121,7 +121,7 @@ if __name__=="__main__":
         X = actvs[fca_layers[0]]
         print("X:", X.shape, type(X))
         print("Performing PCA")
-        pca = perform_pca(X, scale=True)
+        pca = perform_pca(X, center=True, scale=True)
 
         exp_var = pca["prop_explained_variance"].cpu().data.numpy()
         print(
@@ -151,8 +151,12 @@ if __name__=="__main__":
         )
         
         pcs = pca["components"]
+        means = pca["means"]
+        stds = pca["stds"]
 
         fca = make_fca_from_pca(pcs)
+        fca.set_means(means)
+        fca.set_stds(stds)
         fca.to(device)
         for layer,modu in model.named_modules():
             if layer == fca_layers[0]:
