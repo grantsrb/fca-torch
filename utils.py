@@ -351,10 +351,14 @@ def load_json_or_yaml(file_name):
         return load_yaml(file_name)
     raise NotImplemented
 
-def join_configs(kwargs, defaults):
+def join_configs(kwargs, defaults, add_to_persistants=True):
     config = copy.deepcopy(defaults)
+    persistent_keys = config.get("persistent_keys", [])
     for k in kwargs:
         config[k] = copy.deepcopy(kwargs[k])
+        persistent_keys.append(k)
+    if add_to_persistants:
+        config["persistent_keys"] = persistent_keys
     for param_key in defaults:
         if "params" in param_key:
             config[param_key] = config.get(param_key, {})
