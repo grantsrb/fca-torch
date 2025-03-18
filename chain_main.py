@@ -66,7 +66,6 @@ if __name__ == "__main__":
         "rank": [],
         "cumu_rank": [],
     }
-    assert not config["fca_load_path"] and len(config["fca_layers"])==1
 
     # Optionally limit the number of cumulative dimensions for the FCA
     # Otherwise goes till full model dimensionality
@@ -74,12 +73,12 @@ if __name__ == "__main__":
     if full_rank is None:
         print("Path:", config['model_load_path'])
         checkpoint = load_checkpoint(config['model_load_path'])
-        layer = config["fca_layers"][0]
         sd = checkpoint["model_state_dict"]
+        full_rank = 0
         for key in sd.keys():
             k = key.replace(".weight", "")
-            if k==layer:
-                full_rank = sd[key].shape[0]
+            if k in config["fca_layers"]:
+                full_rank = max(sd[key].shape[0], full_rank)
         if not full_rank:
             full_rank = checkpoint["config"]["model_params"]["d_model"]
 
