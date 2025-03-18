@@ -764,6 +764,8 @@ def get_save_identifier(
             "exp_name",
         },):
     """
+    Returns a string that is somewhat descriptive of the configuration.
+
     Args:
         config: dict
             the keys you want to use first for identification
@@ -782,6 +784,10 @@ def get_save_identifier(
         "true": "T",
         "false": "F",
         "relaxed": "rlxd",
+        "subtract": "sbtrc",
+        "subtrac": "sbtrc",
+        "ensure": "ensr",
+        "ensur": "ensr",
     }
     # add key value pairs to folder name
     if save_keys is None:
@@ -810,3 +816,94 @@ def get_save_identifier(
         n_dupls = get_num_duplicates(save_folder, save_name)
         save_name = save_name + f"_v{n_dupls}"
     return save_name
+
+def count_files(main_folder, name_root=None, substr=None, exts=None):
+    """
+    Counts the files residing in main_folder that have the
+    name_root or substr in their name.
+
+    Args:
+        main_folder: str
+            path to the directory in which you want to count the files
+        name_root: str
+            the starting string of the directories you want to count
+        substr: str
+            a string that can appear anywhere in the file
+        exts: list like of str
+            valid extensions
+
+    Returns:
+        folder_count: int
+    """
+    file_count = 0
+    for _,_,files in os.walk(main_folder):
+        for f in files:
+            plus_one = (name_root is not None and name_root == f[:len(name_root)])
+            plus_one = plus_one or (substr is not None and substr in f)
+            if exts:
+                plus_one = plus_one and (sum([ext in f for ext in exts])>0)
+            file_count += plus_one
+        break
+    return file_count
+
+def count_sub_dirs(main_folder, name_root=None, substr=None):
+    """
+    Counts the directories residing in main_folder that have the
+    name_root in their name.
+
+    Args:
+        main_folder: str
+            path to the directory in which you want to count the folders
+        name_root: str
+            the starting string of the directories you want to count
+
+    Returns:
+        folder_count: int
+    """
+    folder_count = 0
+    for _,subds,_ in os.walk(main_folder):
+        for d in subds:
+            plus_one = name_root and name_root == d[:len(name_root)]
+            plus_one = plus_one or (substr and substr in d)
+            folder_count += plus_one
+        break
+    return folder_count
+
+def get_fca_save_folder(config, save_folder, name_keys=[], mkdirs=True):
+    """
+    Similar to get_save_folder but specialized for fca
+
+    Args:
+        config: dict
+        save_folder: str
+            full path to the folder in which the fca folder will reside
+        name_keys: list of str
+            config keys that will be included with their values in the
+            folder name
+        mkdirs: bool
+            if true, will make the fca save folder if it doesn't exist
+    Returns:
+        fca_save_folder: str
+            full path to the folder
+    """
+    if mkdirs and not os.path.exists(save_folder):
+        os.makedirs(save_folder, exist_ok=True)
+    fca_num = count_sub_dirs(
+        main_folder=save_folder,
+        name_root="fca_chain_"
+    )
+    fca_folder = f"fca_chain_{fca_num}"
+    if name_keys:
+        fca_folder += "_"+get_save_identifier(
+            config=config,
+            save_keys=name_keys,
+        )
+    fca_full_path = os.path.join(save_folder, fca_folder)
+    if mkdirs:
+        os.makedirs(fca_full_path, exist_ok=True)
+    return fca_full_path
+
+if __name__=="__main__":
+    path = "/mnt/fs2/grantsrb/fca_saves/twopairs12345"
+    print("Num Dirs:", count_sub_dirs(main_folder=path, name_root="twopairs12345"))
+

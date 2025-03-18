@@ -13,7 +13,8 @@ The algorithm is as follows:
 from train import train
 from utils import join_configs, get_command_line_args
 from dl_utils.save_io import (
-    get_save_folder, load_checkpoint, get_checkpoints, get_folder_from_path
+    get_save_folder, load_checkpoint, get_checkpoints, get_folder_from_path,
+    get_fca_save_folder,
 )
 from constants import CHAIN_DEFAULTS
 import torch
@@ -28,6 +29,7 @@ if __name__ == "__main__":
     defaults = copy.deepcopy(CHAIN_DEFAULTS)
     arg_config = get_command_line_args()
     config = join_configs(kwargs=arg_config, defaults=defaults)
+
     if not (config.get("model_load_path", None) and config.get("save_to_load_path", False)):
         save_folder, model_folder = get_save_folder(
             config, mkdirs=True, ret_model_folder=True)
@@ -35,7 +37,21 @@ if __name__ == "__main__":
         config["model_folder"] = model_folder
         config["persistent_keys"].append("save_folder")
         config["persistent_keys"].append("model_folder")
+    else:
+        config["save_folder"] = get_folder_from_path(
+            config["model_load_path"]
+        )
 
+    # Create new FCA chain save folder
+    fca_save_folder = get_fca_save_folder(
+        config=config,
+        save_folder=config["save_folder"],
+        name_keys=sorted(list(arg_config.keys())),
+        mkdirs=True,
+    )
+    config["fca_save_folder"] = fca_save_folder
+
+    # Set Random Seed
     config["seed"] = config.get("seed", 123456)
     torch.manual_seed(config["seed"])
     np.random.seed(config["seed"])
@@ -51,12 +67,15 @@ if __name__ == "__main__":
         "cumu_rank": [],
     }
     assert not config["fca_load_path"] and len(config["fca_layers"])==1
-    if "full_rank" not in config:
+
+    # Optionally limit the number of cumulative dimensions for the FCA
+    # Otherwise goes till full model dimensionality
+    full_rank = config.get("full_rank", None)
+    if full_rank is None:
         print("Path:", config['model_load_path'])
         checkpoint = load_checkpoint(config['model_load_path'])
         layer = config["fca_layers"][0]
         sd = checkpoint["model_state_dict"]
-        full_rank = None
         for key in sd.keys():
             k = key.replace(".weight", "")
             if k==layer:
@@ -64,6 +83,7 @@ if __name__ == "__main__":
         if not full_rank:
             full_rank = checkpoint["config"]["model_params"]["d_model"]
 
+    ## FCA Training Loop
     og_config = copy.deepcopy(config)
     metrics = {}
     cumu_rank = 0
@@ -101,7 +121,7 @@ if __name__ == "__main__":
         data_dict["cumu_rank"].append(cumu_rank)
 
         save_path = os.path.join(
-            get_folder_from_path(config["model_load_path"]),
+            fca_save_folder,
             "chain_results.csv",
         )
         df = pd.DataFrame(data_dict)

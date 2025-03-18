@@ -42,6 +42,7 @@ DEFAULTS = {
         'fca_params', 'fca_layers', 'lr',
         "fca_load_path", "batch_size", "num_epochs",
         "ensure_ortho_chain", "do_fca", "persistent_keys",
+        "subtract_prev_fcas", "fca_save_folder",
     ],
 }
 

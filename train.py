@@ -11,7 +11,10 @@ import warnings
 warnings.filterwarnings('ignore')
 
 from utils import collect_activations
-from dl_utils.save_io import record_session, load_checkpoint, get_folder_from_path
+from dl_utils.save_io import (
+    record_session, load_checkpoint, get_folder_from_path,
+    count_files, count_sub_dirs
+)
 from dl_utils.utils import pretty_print_config
 
 class PlateauTracker:
@@ -83,6 +86,8 @@ def train(config, device=None):
     model.to(device)
     print(model)
     criterion = torch.nn.CrossEntropyLoss()
+
+
     optimizer = optim.Adam(
         model.parameters(),
         lr=config['lr']
@@ -101,6 +106,8 @@ def train(config, device=None):
         "val_loss": [],
         "val_acc": [],
     }
+
+    # Determine if fca training
     fca_layers = config.get("fca_layers", None)
     do_fca = config.get("do_fca", fca_layers) and fca_layers
     if do_fca:
@@ -113,6 +120,7 @@ def train(config, device=None):
     if config.get("fca_load_path", None) is not None:
         model.freeze_parameters()
         model_arg = model if config.get("subtract_prev_fcas", True) else None
+        print("model arg:", model_arg)
         loaded_fcas, loaded_handles = load_fcas(
             model=model_arg, load_path=config["fca_load_path"])
 
@@ -317,23 +325,21 @@ def train(config, device=None):
         #    print("Error occurred, closing out")
         #    break
 
-    # Save the trained model
+
+    ## Save the trained model
     if fcas:
         # Ensure final dimensions are updated
         for fca in fcas.values():
             fca.update_parameters()
             fca.freeze_parameters()
-        if config.get("fca_load_path", None) is not None:
-            save_path = config["fca_load_path"]
-            n_chains = 0
-            if "chained" in save_path:
-                try:
-                    n_chains = int(save_path.split("chained")[-1].split(".pt")[0])+1
-                except: pass
-            save_path = save_path.split("_fca")[0]
-            save_path = save_path + f"_fca_chained{n_chains}.pt"
-        else:
-            save_path = save_path.replace(".pt", "_fca.pt")
+
+        save_folder = config.get("fca_save_folder", config["save_folder"])
+        n_chains = count_files(
+            main_folder=save_folder,
+            substr="fca_chain",
+            exts={".pt"}
+        )
+        save_path = f"{save_folder}/fca_chain{n_chains}.pt"
         save_dict = {
             "fca_state_dicts": {
                 layer: fca.state_dict() for layer,fca in fcas.items()
@@ -351,7 +357,7 @@ def train(config, device=None):
             "optimizer_state_dict": optimizer.state_dict(),
             "config": config,
         }
-    print("Saving model to:", save_path)
+    print("Saving to:", save_path)
     torch.save(save_dict, save_path)
     df = pd.DataFrame(data_dict)
     csv_path = save_path.replace(".pt", ".csv")
