@@ -112,8 +112,9 @@ def train(config, device=None):
     loaded_handles = []
     if config.get("fca_load_path", None) is not None:
         model.freeze_parameters()
+        model_arg = model if config.get("subtract_prev_fcas", True) else None
         loaded_fcas, loaded_handles = load_fcas(
-            model=model, load_path=config["fca_load_path"])
+            model=model_arg, load_path=config["fca_load_path"])
 
     # Get the initial loss and accuracy
     with torch.no_grad():

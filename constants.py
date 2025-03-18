@@ -30,6 +30,7 @@ DEFAULTS = {
                          # as this will make the resulting vectors non
                          # orthogonal in the orig activation space
     'fca_load_path': None,
+    "subtract_prev_fcas": True,
     'fca_params': {
         "max_rank": None
     },
