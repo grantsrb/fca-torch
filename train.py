@@ -57,6 +57,11 @@ def train(config, device=None):
         for k in config.get("persistent_keys", []):
             if k in config:
                 conf[k] = config[k]
+        for k,v in config.items():
+            if type(v)==dict:
+                for kk in v:
+                    if kk in config.get("persistent_keys", []):
+                        conf[k][kk] = v[kk]
         config = conf
 
     print("Using Config:")
@@ -185,7 +190,8 @@ def train(config, device=None):
         thresh = config["fca_acc_threshold"]
         train_acc = total_acc/task.n_batches(config["batch_size"])
         val_acc = total_acc_val/val_task.n_batches(config["batch_size"])
-        if do_fca and not loaded_fcas and (thresh>train_acc or thresh>val_acc):
+        fine_tuning = config.get("fine_tuning", False)
+        if not fine_tuning and (do_fca and not loaded_fcas and (thresh>train_acc or thresh>val_acc)):
             print("Insufficient Accuracy for FCA Threshold", thresh)
             return None
 
