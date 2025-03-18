@@ -26,23 +26,30 @@ DEFAULTS = {
     "save_to_load_path": True,
 
     "do_fca": False,
+    "fine_tuning": False, # optionally bypass the initial accuracy threshold in fca runs
     "zscore_fca": False, # Will zscore the reps before fca but be careful
-                         # as this will make the resulting vectors non
-                         # orthogonal in the orig activation space
+        # as this will make the resulting vectors non orthogonal in the
+        # orig activation space
     'fca_load_path': None,
-    "subtract_prev_fcas": True,
+    "subtract_prev_fcas": False, # Will set previously learned FCA
+        # components to remove_components=True. Irrelevant when
+        # ensure_ortho_chain is True and they were trained with remove_components=False
     'fca_params': {
-        "max_rank": None
+        "max_rank": None,
+        "remove_components": False, # Can optionally learn components that
+            # are subtracted from the reps instead of bottlenecking into them.
+            # Mainly makes sense for fine tuning.
     },
     'fca_layers': ["hidden_layers.1"],
     "fca_acc_threshold": 0.99,
-    "ensure_ortho_chain": True, # will load the sd from the previous fca into the newest 
+    "ensure_ortho_chain": True, # will ensure new FCAs are orthogonal to previous FCAs
 
     'persistent_keys': [
         'fca_params', 'fca_layers', 'lr',
         "fca_load_path", "batch_size", "num_epochs",
         "ensure_ortho_chain", "do_fca", "persistent_keys",
         "subtract_prev_fcas", "fca_save_folder",
+        "fine_tuning",
     ],
 }
 

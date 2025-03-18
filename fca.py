@@ -457,7 +457,12 @@ def load_fcas(
         return loaded_fcas, loaded_handles, loaded_paths
     return loaded_fcas, loaded_handles
 
-def initialize_fcas(model, config, loaded_fcas=[], means=None, stds=None):
+def initialize_fcas(
+        model,
+        config,
+        loaded_fcas=[],
+        means=None,
+        stds=None):
     """
     Args:
         model: torch module
