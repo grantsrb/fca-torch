@@ -26,6 +26,7 @@ class FunctionalComponentAnalysis(nn.Module):
                  component_mask=None,
                  means=None,
                  stds=None,
+                 orthogonalization_vectors=None,
                  *args, **kwargs):
         """
         Args:
@@ -49,6 +50,10 @@ class FunctionalComponentAnalysis(nn.Module):
             stds: None or tensor (S,)
                 optionally specify a tensor that will be used to
                 scale the representations before the FCA
+            orthogonalization_vectors: None or list-like of tensors [(S,), ...]
+                Adds a list of vectors to the list of vectors that are
+                excluded from the functional components but are
+                included for orthogonality calculations.
         """
         super().__init__()
         # Sample a single, initial vector and normalize it
@@ -67,6 +72,8 @@ class FunctionalComponentAnalysis(nn.Module):
         self.is_fixed = False
         self.fixed_weight = None
         self.excl_ortho_list = []
+        if orthogonalization_vectors is not None:
+            self.add_excl_ortho_vectors(orthogonalization_vectors)
 
     def set_means(self, means):
         self.register_buffer("means", means)
@@ -371,6 +378,9 @@ class FunctionalComponentAnalysis(nn.Module):
         return torch.matmul(
             x, self.make_matrix(components=components).T
         )
+    
+    def interchange_intervention(self, trg, src):
+        return trg-self(self(trg),inverse=True)+self(self(src),inverse=True)
 
 def load_fcas_from_path(file_path):
     fca_checkpoint = torch.load(file_path)
