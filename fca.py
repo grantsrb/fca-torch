@@ -140,8 +140,13 @@ class FunctionalComponentAnalysis(nn.Module):
         orthogonality via gram schmidt.
         """
         if fixed:
-            self.fixed_weight = self.weight.data.clone()
+            self.fixed_weight = self.weight
         self.is_fixed = fixed
+
+    def reset_fixed_weight(self,):
+        params = self.orthogonalize_parameters()
+        matrix = torch.vstack(params)
+        self.fixed_weight = matrix
 
     def orthogonalize_vector(self, new_vector, prev_vectors, prev_is_cov_mtx=False):
         mtx = prev_vectors
