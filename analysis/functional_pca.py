@@ -38,7 +38,7 @@ def make_fca_from_pca(pc_vecs):
     pc_vecs = [p.squeeze() for p in pc_vecs]
     size = pc_vecs[0].shape[0]
     fca = FunctionalComponentAnalysis(size=size)
-    fca.add_params_from_vector_list(pc_vecs)
+    fca.add_params_from_vector_list(pc_vecs, overwrite=True)
     fca.freeze_parameters()
     fca.set_fixed(True)
     return fca
