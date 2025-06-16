@@ -308,7 +308,7 @@ def train(config, device=None):
                     print("Updating FCA parameters")
                     new_axes = []
                     for fca in fcas.values():
-                        fca.update_parameters()
+                        fca.update_parameters_no_grad()
                         fca.freeze_parameters()
                         p = fca.add_new_axis_parameter()
                         if p is not None:
@@ -336,7 +336,7 @@ def train(config, device=None):
     if fcas:
         # Ensure final dimensions are updated
         for fca in fcas.values():
-            fca.update_parameters()
+            fca.update_parameters_no_grad()
             fca.freeze_parameters()
 
         save_folder = config.get("fca_save_folder", config["save_folder"])
