@@ -826,7 +826,7 @@ def initialize_fcas(
     return fcas, handles, fca_parameters
     
 
-__all__ = [ "FunctionalComponentAnalysis" ]
+__all__ = [ "FunctionalComponentAnalysis", "gram_schmidt", "orthogonalize_vector" ]
 
 # Example usage
 if __name__ == "__main__":
