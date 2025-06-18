@@ -36,7 +36,7 @@ DEFAULTS = {
         # ensure_ortho_chain is True and they were trained with remove_components=False
     'fca_params': {
         "max_rank": None,
-        "remove_components": False, # Can optionally learn components that
+        "use_complement_in_hook": False, # Can optionally learn components that
             # are subtracted from the reps instead of bottlenecking into them.
             # Mainly makes sense for fine tuning.
     },

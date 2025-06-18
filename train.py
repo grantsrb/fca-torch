@@ -2,7 +2,7 @@ import torch
 from modeling import NeuralNetwork
 from tasks import HierarchicalLogicalTask, OPERATION2STRING
 import torch.optim as optim
-from fca import FunctionalComponentAnalysis, load_fcas, initialize_fcas
+from fca import load_fcas, initialize_fcas
 import pandas as pd
 import copy
 import os

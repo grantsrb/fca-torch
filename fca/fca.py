@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 import numpy as np
+import math
+from .schedulers import PlateauTracker
 
 
 def orthogonalize_vector(
@@ -106,7 +108,7 @@ class FunctionalComponentAnalysis(nn.Module):
     def __init__(self,
                  size,
                  max_rank=None,
-                 remove_components_in_hook=False,
+                 use_complement_in_hook=False,
                  component_mask=None,
                  means=None,
                  stds=None,
@@ -125,7 +127,7 @@ class FunctionalComponentAnalysis(nn.Module):
             init_rank: int or None
                 The initial number of components to learn. If None,
                 the rank is 1
-            remove_components_in_hook: bool
+            use_complement_in_hook: bool
                 If True, the model will remove components from
                 the vectors in the forward hook.
             component_mask: tensor
@@ -152,7 +154,7 @@ class FunctionalComponentAnalysis(nn.Module):
         super().__init__()
         self.size = size
         self.max_rank = max_rank if max_rank is not None else size
-        self.remove_components_in_hook = remove_components_in_hook
+        self.use_complement_in_hook = use_complement_in_hook
         self.component_mask = component_mask
         self.orth_with_doubles = orth_with_doubles
         self.set_means(means)
@@ -440,10 +442,12 @@ class FunctionalComponentAnalysis(nn.Module):
                 LongTensor, only the components specified
                 by the tensor are used.
         Returns:
-            matrix: torch.Tensor.
+            matrix: torch.Tensor (R, D)
                 The low rank orthogonal matrix created from
                 the parameter list. Does not include the orthogonalization
-                matrix in the resulting matrix.
+                matrix in the resulting matrix. Each row is an orthogonal
+                component, whereas the number of columns is equal to the
+                dimensionality of the representations. 
         """
         if self.is_cached and self.cached_weight is not None:
             matrix = self.cached_weight.to(self.get_device())
@@ -462,6 +466,14 @@ class FunctionalComponentAnalysis(nn.Module):
         Will construct the matrix by either using the cached_weight
         or will use gram-schmidt to orthogonalize the functional
         components against each other and the orthogonalization matrix.
+
+        Returns:
+            matrix: torch.Tensor (R, D)
+                The low rank orthogonal matrix created from
+                the parameter list. Does not include the orthogonalization
+                matrix in the resulting matrix. Each row is an orthogonal
+                component, whereas the number of columns is equal to the
+                dimensionality of the representations. 
         """
         return self.make_fca_matrix()
 
@@ -469,11 +481,22 @@ class FunctionalComponentAnalysis(nn.Module):
     def rank(self):
         """
         Returns the number of functional components in this object
+
+        Returns:
+            rank: int
+                the number of functional components in the object
         """
         return len(self.parameters_list)
 
     @property
     def n_components(self):
+        """
+        Returns the number of functional components in this object
+
+        Returns:
+            rank: int
+                the number of functional components in the object
+        """
         return self.rank
 
     def get_device(self):
@@ -539,9 +562,9 @@ class FunctionalComponentAnalysis(nn.Module):
     def get_forward_hook(self):
         """
         Returns a forward hook function to perform FCA on a desired
-        module's outputs. Possible to use the `remove_components_in_hook`
+        module's outputs. Possible to use the `use_complement_in_hook`
         field to subtract the projected functional components from the
-        representation as oppsed to using only the projected functional
+        representation as opposed to using only the projected functional
         components.
 
         Returns:
@@ -550,7 +573,7 @@ class FunctionalComponentAnalysis(nn.Module):
         def hook(module, input, output):
             fca_vec = self(output)
             stripped = self(fca_vec, inverse=True)
-            if self.remove_components_in_hook:
+            if self.use_complement_in_hook:
                 stripped = output - stripped
             return stripped
         return hook
@@ -609,6 +632,136 @@ class FunctionalComponentAnalysis(nn.Module):
         This cannot be used with Model Alignment Search!!
         """
         return trg-self(self(trg),inverse=True)+self(self(src),inverse=True)
+
+    def find_sufficient_components(
+        self,
+        model,
+        layer,
+        data,
+        complement_data=None,
+        val_data=None,
+        acc_threshold=0.99,
+        lr=0.001,
+        n_epochs=None,
+        verbose=True,
+    ):
+        """
+        This method trains the functionally sufficient components to
+        acheive the accuracy threshold on the outputs.
+        You can optionally include "labels" in the data dict as a way
+        to specify the objective outputs, otherwise will produce output
+        labels from the model's outputs on the input data. 
+
+        Args:
+            model: torch module
+            layer: str
+                the name of the model module to perform FCA on
+            data: Dataset
+                This iterable should return batches of data that can be
+                fed to the model's forward function as kwargs using the
+                double star notation (**kwargs).
+            complement_data: (optional) Dataset or None
+                optionally argue a dataset for training the complement
+                of the fca object.
+            val_data: (optional) Dataset
+                optionally argue validation data for tracking loss plateaus
+            lr: float
+                learning rate
+            n_epochs: (optional) int or None
+                the number of training epochs. Can also ignore this
+                argument and train till convergence.
+        """
+        plateau_tracker = PlateauTracker()
+        optimizer = torch.optim.Adam(self.parameters(), lr=lr)
+
+        handle = self.hook_model_layer(model=model, layer=layer)
+        loss = math.inf
+        acc = 0
+        metrics = {
+            "train_loss": [],
+            "train_acc": [],
+            "valid_loss": [],
+            "valid_acc": [],
+        }
+        epoch = 0
+        if n_epochs is None: n_epochs = math.inf
+
+        # Begin Training Process
+        while epoch<n_epochs:
+            epoch += 1
+            if verbose:
+                print("\nBeginning Epoch", epoch)
+            
+            # Train
+            self.use_complement_in_hook = False # use only the fca components
+            losses, accs = [],[]
+            for step, batch in enumerate(data):
+                outputs = model(**batch)
+                loss, acc = outputs["loss"], outputs["acc"]
+                loss.backward()
+                optimizer.step()
+                losses.append(loss.item())
+                accs.append(accs.item())
+            metrics["train_loss"].append(np.mean(losses))
+            metrics["train_acc"].append(np.mean(accs))
+            loss,acc = metrics["train_loss"][-1],metrics["train_acc"][-1]
+
+            if verbose:
+                print("Train Loss:", loss.item(), "-- Acc:", acc.item())
+
+            # Train Complement
+            if complement_data is not None:
+                self.use_complement_in_hook = True # use the fca complement
+                losses, accs = [],[]
+                for step, batch in enumerate(data):
+                    outputs = model(**batch)
+                    loss, acc = outputs["loss"], outputs["acc"]
+                    loss.backward()
+                    optimizer.step()
+                    losses.append(loss.item())
+                    accs.append(accs.item())
+                metrics["train_loss"].append(np.mean(losses))
+                metrics["train_acc"].append(np.mean(accs))
+                loss,acc = metrics["train_loss"][-1],metrics["train_acc"][-1]
+
+
+            # Validation
+            if val_data is not None:
+                self.use_complement_in_hook = False
+                losses, accs = [],[]
+                for step, batch in enumerate(val_data):
+                    with torch.no_grad():
+                        outputs = model(**batch)
+                    loss, acc = outputs["loss"], outputs["acc"]
+                    losses.append(loss.item())
+                    accs.append(accs.item())
+                metrics["valid_loss"].append(np.mean(losses))
+                metrics["valid_acc"].append(np.mean(accs))
+                loss,acc = metrics["valid_loss"][-1],metrics["valid_acc"][-1]
+                if verbose:
+                    print("Valid Loss:", loss.item(), "-- Acc:", acc.item())
+
+            # If we achieve our accuracy threshold, we stop the process
+            if acc>=acc_threshold:
+                print("Reached accuracy threshold, stopping process")
+                break
+
+            # Add a new component when performance plateaus
+            if plateau_tracker.update(loss=loss, acc=acc):
+                new_component = self.add_component()
+                if verbose: print("Adding new component! New Rank", self.rank)
+                # If at max_rank, the new_component will not be added
+                if new_component is None:
+                    print("Reached max components, stopping process")
+                    break
+            
+        if epoch==n_epochs and verbose:
+            print("Stopping due to epoch limit")
+        
+        # Remove the hook
+        handle.remove()
+        return metrics
+
 
 class UnnormedFCA(FunctionalComponentAnalysis):
     """
@@ -707,11 +860,17 @@ def load_fcas_from_path(file_path):
 def load_fcas(
         model,
         load_path,
-        remove_components_in_hook=True,
+        use_complement_in_hook=True,
         ret_paths=False,
         verbose=False):
     """
     Simplifies the recursive loading of previous, chained fcas.
+
+    Args:
+        use_complement_in_hook: bool
+            generally want this to be true when chaining fca objects
+            during an fca training. We want to train the new fca on the
+            complement subspace of the previous fcas.
     """
     device = "cpu" if model is None else model.get_device()
 
@@ -731,7 +890,7 @@ def load_fcas(
         ret = load_fcas(
             model=model,
             load_path=fca_config["fca_load_path"],
-            remove_components_in_hook=remove_components_in_hook,
+            use_complement_in_hook=use_complement_in_hook,
             ret_paths=ret_paths,
             verbose=verbose,
         )
@@ -755,7 +914,7 @@ def load_fcas(
     for layer in state_dicts:
         sd = state_dicts[layer]
         kwargs["size"] = sd[list(sd.keys())[0]].shape[0]
-        kwargs["remove_components_in_hook"] = remove_components_in_hook
+        kwargs["use_complement_in_hook"] = use_complement_in_hook
         fcas[layer] = FunctionalComponentAnalysis( **kwargs )
         fcas[layer].load_sd(sd)
         fcas[layer].freeze_parameters()
