@@ -637,8 +637,7 @@ class FunctionalComponentAnalysis(nn.Module):
         self,
         model,
         layer,
-        data,
-        complement_data=None,
+        data_loader,
         val_data=None,
         acc_threshold=0.99,
         lr=0.001,
@@ -648,7 +647,7 @@ class FunctionalComponentAnalysis(nn.Module):
         """
         This method trains the functionally sufficient components to
         acheive the accuracy threshold on the outputs.
-        You can optionally include "labels" in the data dict as a way
+        You can optionally include "labels" in the data as a way
         to specify the objective outputs, otherwise will produce output
         labels from the model's outputs on the input data. 
 
@@ -656,13 +655,10 @@ class FunctionalComponentAnalysis(nn.Module):
             model: torch module
             layer: str
                 the name of the model module to perform FCA on
-            data: Dataset
+            data_loader: data iterable
                 This iterable should return batches of data that can be
                 fed to the model's forward function as kwargs using the
                 double star notation (**kwargs).
-            complement_data: (optional) Dataset or None
-                optionally argue a dataset for training the complement
-                of the fca object.
             val_data: (optional) Dataset
                 optionally argue validation data for tracking loss plateaus
             lr: float
@@ -675,6 +671,10 @@ class FunctionalComponentAnalysis(nn.Module):
         optimizer = torch.optim.Adam(self.parameters(), lr=lr)
 
         handle = self.hook_model_layer(model=model, layer=layer)
+        if handle is None:
+            layer = "model." + layer
+            handle = self.hook_model_layer(model=model, layer=layer)
+        assert handle is not None, "Failed to find layer "+str(layer)
         loss = math.inf
         acc = 0
         metrics = {
@@ -693,37 +693,20 @@ class FunctionalComponentAnalysis(nn.Module):
                 print("\nBeginning Epoch", epoch)
             
             # Train
-            self.use_complement_in_hook = False # use only the fca components
             losses, accs = [],[]
-            for step, batch in enumerate(data):
+            for step, batch in enumerate(data_loader):
                 outputs = model(**batch)
                 loss, acc = outputs["loss"], outputs["acc"]
                 loss.backward()
                 optimizer.step()
                 losses.append(loss.item())
-                accs.append(accs.item())
+                accs.append(acc.item())
             metrics["train_loss"].append(np.mean(losses))
             metrics["train_acc"].append(np.mean(accs))
             loss,acc = metrics["train_loss"][-1],metrics["train_acc"][-1]
 
             if verbose:
                 print("Train Loss:", loss.item(), "-- Acc:", acc.item())
-
-            # Train Complement
-            if complement_data is not None:
-                self.use_complement_in_hook = True # use the fca complement
-                losses, accs = [],[]
-                for step, batch in enumerate(data):
-                    outputs = model(**batch)
-                    loss, acc = outputs["loss"], outputs["acc"]
-                    loss.backward()
-                    optimizer.step()
-                    losses.append(loss.item())
-                    accs.append(accs.item())
-                metrics["train_loss"].append(np.mean(losses))
-                metrics["train_acc"].append(np.mean(accs))
-                loss,acc = metrics["train_loss"][-1],metrics["train_acc"][-1]
-
 
             # Validation
             if val_data is not None:
