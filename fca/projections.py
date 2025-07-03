@@ -123,7 +123,10 @@ def perform_pca(
         center=True,
         transform_data=False,
         full_matrices=False,
-        randomized=False):
+        randomized=False,
+        use_eigen=True,
+        verbose=True,
+):
     """
     Perform PCA on the data matrix X
 
@@ -141,6 +144,9 @@ def perform_pca(
         randomized: bool
             if true, will use randomized svd for faster
             computations
+        use_eigen: bool
+            if true, will use an eigen decomposition on the
+            covariance matrix of X to save compute
     Returns:
         ret_dict: dict
             A dictionary containing the following keys:
@@ -148,15 +154,25 @@ def perform_pca(
                 The principal components (eigenvectors) of the data.
             - "explained_variance": tensor (n_components,)
                 The explained variance for each principal component.
-            - "prop_explained_variance": tensor (n_components,)
+            - "proportion_expl_var": tensor (n_components,)
                 The proportion of explained variance for each principal component.
             - "means": tensor (N,)
                 The mean of each feature (column) in the data.
             - "stds": tensor (N,)
                 The standard deviation of each feature (column) in the data.
             - "transformed_X": tensor (M, n_components)
-                The data projected onto the principal components, if transform_data is True.
+                The data projected onto the principal components, if
+                transform_data is True.
     """
+    if use_eigen:
+        return perform_eigen_pca(
+            X=X,
+            n_components=n_components,
+            scale=scale,
+            center=center,
+            transform_data=transform_data,
+            verbose=verbose,
+        )
     if n_components is None:
         n_components = X.shape[-1]
         
@@ -177,6 +193,7 @@ def perform_pca(
             svd_kwargs["compute_uv"] = True
             svd = np.linalg.svd
     assert not n_components or X.shape[-1]>=n_components
+
     # Center the data by subtracting the mean along each feature (column)
     means = torch.zeros_like(X[0])
     if center:
@@ -190,6 +207,7 @@ def perform_pca(
     
     # Compute the SVD of the centered data
     # X = U @ diag(S) @ Vh, where Vh contains the principal components as its rows
+    if verbose: print("Performing SVD")
     U, S, Vh = svd(X, **svd_kwargs)
     
     # The principal components (eigenvectors) are the first n_components rows of Vh
@@ -197,12 +215,12 @@ def perform_pca(
     
     # Explained variance for each component can be computed from the singular values
     explained_variance = (S[:n_components] ** 2) / (X.shape[0] - 1)
-    prop_explained_variance = explained_variance/explained_variance.sum()
+    proportion_expl_var = explained_variance/explained_variance.sum()
     
     ret_dict = {
         "components": components,
         "explained_variance": explained_variance,
-        "prop_explained_variance": prop_explained_variance,
+        "proportion_expl_var": proportion_expl_var,
         "means": means,
         "stds": stds,
     }
@@ -212,6 +230,94 @@ def perform_pca(
         ret_dict["transformed_X"] = X @ components.T
 
     return ret_dict
+
+def perform_eigen_pca(
+        X,
+        n_components=None,
+        scale=True,
+        center=True,
+        transform_data=False,
+        verbose=True,
+):
+    """
+    Perform PCA on the data matrix X by using an eigen decomp on
+    the covariance matrix
+
+    Args:
+        X: tensor (M,N)
+        n_components: int
+            optionally specify the number of components
+        scale: bool
+            if true, will scale the data along each column
+        transform_data: bool
+            if true, will compute and return the transformed
+            data
+    Returns:
+        ret_dict: dict
+            A dictionary containing the following keys:
+            - "components": tensor (N, n_components)
+                The principal components (eigenvectors) of the data.
+            - "explained_variance": tensor (n_components,)
+                The explained variance for each principal component.
+            - "proportion_expl_var": tensor (n_components,)
+                The proportion of explained variance for each principal component.
+            - "means": tensor (N,)
+                The mean of each feature (column) in the data.
+            - "stds": tensor (N,)
+                The standard deviation of each feature (column) in the data.
+            - "transformed_X": tensor (M, n_components)
+                The data projected onto the principal components, if
+                transform_data is True.
+    """
+    if n_components is None:
+        n_components = X.shape[-1]
+        
+    svd_kwargs = {}
+    if type(X)==torch.Tensor:
+        eigen_fn = torch.linalg.eigh
+    elif type(X)==np.ndarray:
+        eigen_fn = np.linalg.eigh
+    assert not n_components or X.shape[-1]>=n_components
+
+    # Center the data by subtracting the mean along each feature (column)
+    means = torch.zeros_like(X[0])
+    if center:
+        means = X.mean(dim=0, keepdim=True)
+        X = X - means
+    stds = torch.ones_like(X[0])
+    if scale:
+        stds = (X.std(0)+1e-6)
+        X = X/stds
+    
+    # Use eigendecomposition of the covariance matrix for efficiency
+    # Cov = (1 / (M - 1)) * X^T X
+    cov = X.T @ X / (X.shape[0] - 1)  # shape (N, N)
+
+    # Compute eigenvalues and eigenvectors
+    eigvals, eigvecs = eigen_fn(cov)  # eigvals in ascending order
+
+    # Select top n_components in descending order
+    eigvals = eigvals[-n_components:].flip(0)
+    eigvecs = eigvecs[:, -n_components:].flip(1)  # shape (N, n_components)
+
+    explained_variance = eigvals
+    proportion_expl_var = explained_variance / explained_variance.sum()
+    components = eigvecs.T  # shape (n_components, N)
+
+    ret_dict = {
+        "components": components,
+        "explained_variance": explained_variance,
+        "proportion_expl_var": proportion_expl_var,
+        "means": means,
+        "stds": stds,
+    }
+    if transform_data:
+        # Project the data onto the principal components
+        # Note: components.T has shape (features, n_components)
+        ret_dict["transformed_X"] = X @ components.T
+
+    return ret_dict
+
 
 __all__ = [
     "matrix_projinv", "projinv_expl_variance", "lost_variance", "explained_variance",
