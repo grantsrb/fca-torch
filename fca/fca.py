@@ -4,6 +4,7 @@ import numpy as np
 import math
 from .schedulers import PlateauTracker
 from .projections import perform_pca, explained_variance
+from .utils import fca_image_prep
 
 
 def orthogonalize_vector(
@@ -116,6 +117,7 @@ class FunctionalComponentAnalysis(nn.Module):
                  orthogonalization_vectors=None,
                  init_rank=None,
                  init_vectors=None,
+                 init_noise=None,
                  orth_with_doubles=False,
                  *args, **kwargs):
         """
@@ -147,6 +149,8 @@ class FunctionalComponentAnalysis(nn.Module):
             init_vectors: None or list-like of tensors [(S,), ...]
                 Adds a list of vectors to the parameters list
                 without orthogonalizing them.
+            init_noise: None or float
+                Adds noise to the initialization vectors
             orth_with_doubles: bool
                 if true, will orthogonalize vectors in double precision.
                 This is useful for larger ranks, as the error increases
@@ -166,12 +170,14 @@ class FunctionalComponentAnalysis(nn.Module):
         # Orthogonalization matrix defines a matrix for which the FCs
         # need to be orthogonal to.
         self.orthogonalization_mtx = None
-        init_rank = 1 if init_rank is None else init_rank
-        for i in range(init_rank):
-            vec = None
-            if init_vectors is not None and i < len(init_vectors):
-                    vec = init_vectors[i]
-            self.add_component(vec)
+        self.init_vectors = init_vectors
+        self.init_noise = init_noise if init_noise is not None else 0.1
+        if init_vectors is not None and init_rank is None:
+            init_rank = len(init_vectors)
+        else:
+            init_rank = 1 if init_rank is None else init_rank
+        for _ in range(init_rank):
+            self.add_component()
         # If is_cached, the components are frozen in their orthogonal
         # normalized state. Can still track gradients.
         self.is_cached = False
@@ -188,6 +194,8 @@ class FunctionalComponentAnalysis(nn.Module):
         Means are used to center the representations before extracting
         functional components.
         """
+        if means is not None:
+            means = means.squeeze()
         self.register_buffer("means", means)
 
     def set_stds(self, stds):
@@ -195,6 +203,8 @@ class FunctionalComponentAnalysis(nn.Module):
         Standard deviations are used to scale the representations
         before extracting functional components.
         """
+        if stds is not None:
+            stds = stds.squeeze()
         self.register_buffer("stds", stds)
 
     def add_new_axis_parameter(self, init_vector=None):
@@ -214,8 +224,12 @@ class FunctionalComponentAnalysis(nn.Module):
         # Sample a new axis and add it to the parameter list
         if init_vector is not None:
             new_axis = init_vector.clone()
+        elif self.init_vectors is not None and self.rank<len(self.init_vectors):
+            new_axis = self.init_vectors[self.rank].clone()
         else:
             new_axis = torch.randn(self.size)
+        if self.init_noise is not None and self.init_noise>0:
+            new_axis += torch.randn(self.size) * self.init_noise
         p = nn.Parameter(new_axis).to(self.get_device())
         self.parameters_list.append(p)
         self.train_list.append(p)
@@ -246,7 +260,7 @@ class FunctionalComponentAnalysis(nn.Module):
         """
         Removes all functional components from the FCA.
         """
-        for _ in range(self.rank):
+        for _ in range(self.rank-1):
             self.remove_component()
 
     def update_orthogonalization_mtx(
@@ -582,17 +596,54 @@ class FunctionalComponentAnalysis(nn.Module):
             hook: python function
         """
         def hook(module, input, output):
-            if comms_dict is not None:
-                if type(output)!=torch.Tensor:
-                    comms_dict[self] = output["hidden_states"]
-                else:
-                    comms_dict[self] = output
             if type(output)!=torch.Tensor:
-                stripped = self.projinv(output["hidden_states"])
+                reps = output["hidden_states"]
             else:
-                stripped = self.projinv(output)
+                reps = output
+            if comms_dict is not None:
+                comms_dict[self] = reps
+
+            stripped = self.projinv(reps)
             if self.use_complement_in_hook:
-                stripped = output - stripped
+                stripped = reps - stripped
+            if type(output)!=torch.Tensor:
+                output["hidden_states"] = stripped
+            else:
+                output = stripped
+            return output
+        return hook
+
+    def get_image_forward_hook(self, comms_dict=None):
+        """
+        Returns a forward hook function to perform FCA on a desired
+        module's outputs. Possible to use the `use_complement_in_hook`
+        field to subtract the projected functional components from the
+        representation as opposed to using only the projected functional
+        components.
+
+        Args:
+            comms_dict: dict or None
+                dict to collect activations before applying fca.
+        Returns:
+            hook: python function
+        """
+        def hook(module, input, output):
+            if type(output)!=torch.Tensor:
+                reps = output["hidden_states"]
+            else:
+                reps = output
+            if comms_dict is not None:
+                comms_dict[self] = reps
+
+            og_shape = reps.shape
+            reps = fca_image_prep(reps)
+
+            stripped = self.projinv(reps)
+            if self.use_complement_in_hook:
+                stripped = reps - stripped
+
+            stripped = fca_image_prep(stripped, og_shape=og_shape, inverse=True)
+
             if type(output)!=torch.Tensor:
                 output["hidden_states"] = stripped
             else:
@@ -600,7 +651,7 @@ class FunctionalComponentAnalysis(nn.Module):
             return output
         return hook
     
-    def hook_model_layer(self, model, layer, comms_dict=None):
+    def hook_model_layer(self, model, layer, comms_dict=None, rep_type="language"):
         """
         Helper function to register the forward hook produced from
         `get_forward_hook` to the argued model's argued layer.
@@ -611,12 +662,22 @@ class FunctionalComponentAnalysis(nn.Module):
                 the layer to register the forward hook.
             comms_dict: dict
                 dict to collect activations before applying fca
+            rep_type: str
+                the representation type. Valid options are
+                - "images": assumes latent shape of (B,C,H,W)
+                - "language": assumes latent shape of (B,S,D)
+                - "mlp": assumes latent shape of (B,D)
         """
         for mlayer,modu in model.named_modules():
             if layer==mlayer:
-                return modu.register_forward_hook(
-                    self.get_forward_hook(comms_dict=comms_dict)
-                )
+                if rep_type in {"image", "images"}:
+                    return modu.register_forward_hook(
+                        self.get_image_forward_hook(comms_dict=comms_dict)
+                    )
+                else:
+                    return modu.register_forward_hook(
+                        self.get_forward_hook(comms_dict=comms_dict)
+                    )
         return None
 
     def forward(self, x, inverse=False, components=None):
@@ -891,8 +952,9 @@ class PCAFunctionalComponentAnalysis(FunctionalComponentAnalysis):
         """
         self.pca_info = self.perform_pca(
             X=X, scale=scale, center=center, **kwargs, )
+        if "size" not in kwargs: kwargs["size"] = X.shape[-1]
         super().__init__(
-            *args, **kwargs,
+            **kwargs,
             means=self.pca_info.get("means", None),
             stds=self.pca_info.get("stds", None),
         )
@@ -905,20 +967,17 @@ class PCAFunctionalComponentAnalysis(FunctionalComponentAnalysis):
         """
         if rank is None: rank = self.max_rank
         if actvs is None:
-            return self.pca_info["explained_variance_ratio_"][:rank].sum()
+            return self.pca_info["proportion_expl_var"][:rank].sum()
         projinvs = self.projinv(actvs)
         return explained_variance( preds=projinvs, labels=actvs, )
-
 
     def update_parameters_with_pca(self, *args, **kwargs):
         """ Updates the parameters of the FCA with PCA components. """
         if self.rank > 1: self.remove_all_components()
         vecs = self.pca_info["components"][:self.max_rank]
         self.add_params_from_vector_list( vecs, overwrite=True )
-        vecs = self.pca_info["components"][self.max_rank:]
-        if len(vecs)>0:
-            self.add_excl_ortho_vectors(vecs)
-        self.cached_weight = torch.vstack(self.parameters_list).to(self.get_device())
+        self.cached_weight = torch.vstack(
+            [p for p in self.parameters_list]).to(self.get_device())
 
     def set_max_rank(self, max_rank):
         """
@@ -932,7 +991,6 @@ class PCAFunctionalComponentAnalysis(FunctionalComponentAnalysis):
         X,
         scale=True,
         center=True,
-        randomized=False,
         *args, **kwargs,
     ):
         """
@@ -945,8 +1003,6 @@ class PCAFunctionalComponentAnalysis(FunctionalComponentAnalysis):
                 If True, scales the data before performing PCA.
             center: bool
                 If True, centers the data before performing PCA.
-            randomized: bool
-                If True, uses randomized SVD for faster computation.
         Returns:
             ret_dict: list of tensors [(S,), ...]
                 The principal components of the input data.
@@ -957,8 +1013,7 @@ class PCAFunctionalComponentAnalysis(FunctionalComponentAnalysis):
             scale=scale,
             center=center,
             transform_data=False,
-            full_matrices=False,
-            randomized=randomized
+            use_eigen=True,
         )
 
 def load_fcas_from_path(file_path):
