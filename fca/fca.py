@@ -1,10 +1,11 @@
+import os
 import torch
 import torch.nn as nn
 import numpy as np
 import math
 from .schedulers import PlateauTracker
 from .projections import perform_pca, explained_variance
-from .utils import fca_image_prep
+from .utils import fca_image_prep, load_json_or_yaml
 
 
 def orthogonalize_vector(
@@ -1016,6 +1017,38 @@ class PCAFunctionalComponentAnalysis(FunctionalComponentAnalysis):
             use_eigen=True,
         )
 
+def load_fca_from_path(save_dir):
+    """
+    Loads a single FCA from a file path.
+
+    Args:
+        save_dir: str
+            The path to the FCA checkpoint save directory.
+    Returns:
+        fca: FunctionalComponentAnalysis
+            The loaded FCA object.
+    """
+    if not os.path.exists(save_dir):
+        raise FileNotFoundError(f"File not found: {save_dir}")
+    if not os.path.isdir(save_dir):
+        save_dir = "/".join(save_dir.split("/")[:-1])  # Remove the last part if it's a file
+    
+    # Load the FCA checkpoint
+    checkpt_path = os.path.join(save_dir, "fca_best.pt")
+    fca_state_dict = torch.load(checkpt_path, map_location="cpu")
+    config_path = os.path.join(save_dir, "fca_config.yaml")
+    fca_config = load_json_or_yaml(config_path)
+    
+    # Initialize the FCA object
+    kwargs = fca_config.get("fca_params", {})
+    fca = FunctionalComponentAnalysis(**kwargs)
+    fca.load_sd(fca_state_dict)
+    fca.update_parameters_no_grad()
+    fca.freeze_parameters()
+    fca.set_cached(True)
+    
+    return fca
+
 def load_fcas_from_path(file_path):
     fca_checkpoint = torch.load(file_path)
     fca_config = fca_checkpoint["config"]
@@ -1159,8 +1192,28 @@ def initialize_fcas(
             fca_parameters += list(fcas[name].parameters())
     return fcas, handles, fca_parameters
     
+def load_ortho_fcas(fca, fca_save_list):
+    """
+    Loads the orthogonalization vectors from a list of FCA objects.
+    This is useful for loading the orthogonalization vectors from a
+    previous or multiple FCA objects.
 
-__all__ = [ "FunctionalComponentAnalysis", "gram_schmidt", "orthogonalize_vector" ]
+    Args:
+        fca: FunctionalComponentAnalysis object
+            The FCA object to load the orthogonalization vectors into.
+        fca_save_list: list of FunctionalComponentAnalysis objects or save paths
+            The list of FCA objects to load the orthogonalization vectors from.
+    """
+    for prev_fca in fca_save_list:
+        if type(prev_fca) is str:
+            prev_fca = load_fca_from_path(prev_fca)
+        fca.add_excl_ortho_vectors(prev_fca.parameters_list)
+
+__all__ = [
+    "FunctionalComponentAnalysis", "gram_schmidt",
+    "orthogonalize_vector", "load_ortho_fcas",
+    "load_fca_from_path", "load_fcas_from_path",
+]
 
 # Example usage
 if __name__ == "__main__":
