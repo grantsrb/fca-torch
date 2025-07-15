@@ -1,21 +1,24 @@
 import os
 import csv
 import yaml
+from datetime import datetime
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from datetime import datetime
 from torch.utils.data import DataLoader
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from transformers import (
+    AutoTokenizer, AutoModelForSequenceClassification,
+    AutoModelForCausalLM,
+)
 from datasets import load_dataset
-import matplotlib.pyplot as plt
-from fca.fca import FunctionalComponentsAnalysis, load_ortho_fcas  # Assuming you have a custom FCA module
+
+from fca.fca import FunctionalComponentAnalysis, load_ortho_fcas  # Assuming you have a custom FCA module
 from fca.utils import get_command_line_args, get_output_size
 from fca.wrappers import wrapped_kl_divergence  # Assuming you have a custom wrapper for KL divergence
 
 # --------- Configuration ---------
 ROOT_DIR = os.getcwd()
-MODEL_NAME = "distilbert-base-uncased"
+MODEL_NAME = "openai-community/gpt2"
 BATCH_SIZE = 16
 TARGET_LAYER_NAME = "transformer.layer.5.output"
 TOLERANCE = 0.01
@@ -23,7 +26,7 @@ PATIENCE = 3
 LEARNING_RATE = 1e-3
 LOG_EVERY = 2
 MAX_EPOCHS = 100
-DATASET_NAME = "toxicity"  # replace with 'jigsaw-toxic-comment-classification' if using a local version
+DATASET_NAME = 'anitamaxvim/jigsaw-toxic-comments' #"Johnesss/Jigsaw-Toxic-Comment-Classification"  # replace with 'jigsaw-toxic-comment-classification' if using a local version
 RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
 
 if __name__ == "__main__":
@@ -53,8 +56,22 @@ if __name__ == "__main__":
         writer = csv.writer(csvfile)
         writer.writerow(["epoch", "avg_loss", "behavior_match", "num_components"])
 
+    # --------- Model Setup ---------
+    #base_model = AutoModelForSequenceClassification.from_pretrained(
+    base_model = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME,
+        num_labels=2,)
+    base_model.eval()
+    for param in base_model.parameters():
+        param.requires_grad = False
+
+    model = AutoModelForSequenceClassification.from_pretrained(
+        MODEL_NAME, num_labels=2)
+    model.eval()
+
     # --------- Dataset & Tokenizer ---------
     dataset = load_dataset(config["dataset"], split="train[:5000]")
+    print("MOdel Name:", MODEL_NAME)
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
     def collate_fn(batch):
@@ -68,27 +85,6 @@ if __name__ == "__main__":
         shuffle=True,
         collate_fn=collate_fn,
     )
-
-    # --------- Model Setup ---------
-    base_model = AutoModelForSequenceClassification.from_pretrained(
-        MODEL_NAME,
-        num_labels=2,)
-    base_model.eval()
-    for param in base_model.parameters():
-        param.requires_grad = False
-
-    model = AutoModelForSequenceClassification.from_pretrained(
-        MODEL_NAME, num_labels=2)
-    model.eval()
-    size = get_output_size(
-        model=model,
-        layer_name=TARGET_LAYER_NAME,
-        data_sample=next(iter(dataloader))
-    )
-    config["fca_params"] = {
-        "size": size,
-        "max_components": size,
-    }
 
     # --------- Initial Model Performance ---------
 
@@ -109,9 +105,19 @@ if __name__ == "__main__":
     with open(os.path.join(LOG_DIR, "config.yaml"), "w") as f:
         yaml.dump(config, f)
 
-    # --------- Functional Components Analysis (FCA) Setup ---------
+    # --------- Functional Component Analysis (FCA) Setup ---------
 
-    fca = FunctionalComponentsAnalysis(**config["fca_params"])
+    size = get_output_size(
+        model=model,
+        layer_name=TARGET_LAYER_NAME,
+        data_sample=batch,
+    )
+    config["fca_params"] = {
+        "size": size,
+        "max_components": size,
+    }
+
+    fca = FunctionalComponentAnalysis(**config["fca_params"])
     if "ortho_fcas" in config and config["ortho_fcas"]:
         fca = load_ortho_fcas(fca, config["ortho_fcas"])
 
@@ -193,6 +199,7 @@ if __name__ == "__main__":
     hook.remove()
 
     # --------- Subspace Visualization ---------
+    import matplotlib.pyplot as plt
     plt.figure(figsize=(6, 4))
     plt.plot(range(len(match_history)), [fca.num_components for _ in match_history], marker='o')
     plt.title("Subspace Evolution")
