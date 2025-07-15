@@ -561,3 +561,27 @@ def extract_ids(string, tokenizer):
         ids = ids[:-1]
     return ids
 
+def get_output_size(model, layer_name, data_sample=None):
+    """
+    Returns the output size of the layer with the given name in the model.
+    
+    Args:
+        model: torch Module
+        layer_name: str
+            The name of the layer to get the output size from.
+    
+    Returns:
+        int: The output size of the layer.
+    """
+    if data_sample is not None:
+        return collect_activations(
+            model=model,
+            input_data=data_sample,
+            layers=[layer_name],
+            to_cpu=True
+        )[layer_name].shape[-1]
+
+    for name, module in model.named_modules():
+        if name == layer_name:
+            return module.out_features if hasattr(module, 'out_features') else module.weight.shape[-1]
+    raise ValueError(f"Failed to get output size for '{layer_name}'")
