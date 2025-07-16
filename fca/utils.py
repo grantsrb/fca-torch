@@ -49,7 +49,10 @@ def get_activations_hook(comms_dict, key="source", to_cpu=False):
                 else:
                     comms_dict[key].append(out["attentions"].cpu())
             else:
-                comms_dict[key].append(out.cpu())
+                try:
+                    comms_dict[key].append(out.cpu())
+                except:
+                    comms_dict[key].append(out[0].cpu())
     else:
         def hook(module, inp, out):
             if type(out)==dict:
@@ -561,6 +564,26 @@ def extract_ids(string, tokenizer):
         ids = ids[:-1]
     return ids
 
+def arglast(mask, dim=None, axis=-1):
+    """
+    This function finds the index of the last max value along a given
+    dimension. torch.flip creates a copy of the tensor, so it's
+    actually not as efficient as using numpy's np.flip which only
+    returns a view.
+
+    Args:
+        mask: bool (B,N)
+        dim: int
+    Returns:
+        the index of the last true value along the dimension
+    """
+    if dim is None: dim = axis
+    if type(mask)==type(np.zeros(1)):
+        argmaxs = np.argmax(np.flip(mask, axis=dim), axis=dim)
+    else:
+        argmaxs = torch.argmax(torch.flip(mask, dims=(dim,)), dim=dim)
+    return mask.shape[dim] - argmaxs - 1
+
 def get_output_size(model, layer_name, data_sample=None):
     """
     Returns the output size of the layer with the given name in the model.
@@ -569,17 +592,23 @@ def get_output_size(model, layer_name, data_sample=None):
         model: torch Module
         layer_name: str
             The name of the layer to get the output size from.
+        data_sample: dict or None
+            A sample of the data to use for determining the output size.
+            If None, the function will try to find the output size from the model
+            directly.
     
     Returns:
         int: The output size of the layer.
     """
     if data_sample is not None:
-        return collect_activations(
-            model=model,
-            input_data=data_sample,
-            layers=[layer_name],
-            to_cpu=True
-        )[layer_name].shape[-1]
+        with torch.no_grad():
+            return collect_activations(
+                model=model,
+                input_data=data_sample["input_ids"],
+                attention_mask=data_sample.get("attention_mask", None),
+                layers=[layer_name],
+                to_cpu=True
+            )[layer_name].shape[-1]
 
     for name, module in model.named_modules():
         if name == layer_name:
