@@ -229,7 +229,7 @@ def wrap_data(data, complement_data=None, shuffle=True, batch_size=128):
     )
     return data_loader
 
-def wrapped_kl_divergence(preds, labels, preds_arg_logits=True):
+def wrapped_kl_divergence(preds, labels, preds_are_logits=True):
     """
     Computes the KL divergence between two categorical distributions.
     
@@ -238,14 +238,14 @@ def wrapped_kl_divergence(preds, labels, preds_arg_logits=True):
             Predicted probabilities.
         labels: torch Tensor (B, P)
             True probabilities.
-        preds_arg_logits: bool
+        preds_are_logits: bool
             If True, assumes preds are logits and applies log softmax.
             If False, assumes preds are probabilities and applies log.
     Returns:
         kl_div: torch Tensor (1,)
             The KL divergence value.
     """
-    if preds_arg_logits:
+    if preds_are_logits:
         preds = F.log_softmax(preds, dim=-1)
     else:
         preds = preds.log()
