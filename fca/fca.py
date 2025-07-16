@@ -597,18 +597,27 @@ class FunctionalComponentAnalysis(nn.Module):
             hook: python function
         """
         def hook(module, input, output):
-            if type(output)!=torch.Tensor:
+            if type(output)!=torch.Tensor and "hidden_states" in output:
                 reps = output["hidden_states"]
+            elif type(output)!=torch.Tensor and hasattr(output, "hidden_states"):
+                reps = output.hidden_states
+            elif type(output)==tuple:
+                reps = output[0]
             else:
                 reps = output
+
             if comms_dict is not None:
                 comms_dict[self] = reps
 
             stripped = self.projinv(reps)
             if self.use_complement_in_hook:
                 stripped = reps - stripped
-            if type(output)!=torch.Tensor:
+            if type(output)!=torch.Tensor and "hidden_states" in output:
                 output["hidden_states"] = stripped
+            elif type(output)!=torch.Tensor and hasattr(output, "hidden_states"):
+                output.hidden_states = stripped
+            elif type(output)==tuple:
+                output = (stripped,) + output[1:]
             else:
                 output = stripped
             return output
