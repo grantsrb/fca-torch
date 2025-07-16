@@ -8,6 +8,8 @@ from tqdm import tqdm
 import copy
 from sklearn.utils.extmath import randomized_svd
 
+__all__ = ["collect_activations", "collect_activations_using_loader"]
+
 def device_fxn(device):
     if device<0: return "cpu"
     return device
@@ -47,7 +49,10 @@ def get_activations_hook(comms_dict, key="source", to_cpu=False):
                 else:
                     comms_dict[key].append(out["attentions"].cpu())
             else:
-                comms_dict[key].append(out.cpu())
+                try:
+                    comms_dict[key].append(out.cpu())
+                except:
+                    comms_dict[key].append(out[0].cpu())
     else:
         def hook(module, inp, out):
             if type(out)==dict:
@@ -66,6 +71,7 @@ def register_activation_hooks(
     hooked_layers = set()
     for name, mod in model.named_modules():
         if name in layers:
+            print("Hooking layer", name)
             hooked_layers.add(name)
             hook = get_activations_hook(
                 comms_dict=comms_dict,
@@ -96,7 +102,7 @@ def collect_activations(
         batch_size=500,
         to_cpu=True,
         ret_attns=False,
-        ret_pred_ids=False,
+        ret_preds=False,
         tforce=False,
         n_steps=0,
         ret_gtruth=False,
@@ -120,8 +126,9 @@ def collect_activations(
             If true, torch tensors will be placed onto the cpu.
         ret_attn: bool
             if true, will return the attention values as well.
-        ret_pred_ids: bool
-            if true, will return the prediction ids under "pred_ids"
+        ret_preds: bool
+            if true, will return the prediction ids under "pred_ids" and
+            logits under "logits"
         tforce: bool
             will use teacher forcing on all inputs if true. if false,
             uses the task mask to determine when to teacher force.
@@ -156,8 +163,9 @@ def collect_activations(
     if ret_attns:
         assert len(input_data)<=batch_size
         outputs["attentions"] = []
-    outputs["logits"] = []
-    if ret_pred_ids: outputs["pred_ids"] = []
+    if ret_preds:
+        outputs["pred_ids"] = []
+        outputs["logits"] = []
     rnge = range(0,len(input_data), batch_size)
     if verbose: rnge = tqdm(rnge)
     for batch in rnge:
@@ -188,7 +196,7 @@ def collect_activations(
                 output_attentions=ret_attns,)
         if ret_attns and type(out_dict)!=torch.Tensor:
             outputs["attentions"].append(out_dict["attentions"][0])
-        if ret_pred_ids:
+        if ret_preds:
             if type(out_dict)!=torch.Tensor and "pred_ids" in out_dict:
                 outputs["logits"].append(out_dict["logits"])
                 outputs["pred_ids"].append(out_dict["pred_ids"])
@@ -204,7 +212,153 @@ def collect_activations(
                 if len(output)==0:
                     print(k, "isn't producing")
                     assert False
-                if len(output[0].shape)<=4:
+                if len(output)==1 and len(output[0].shape)==4: # Assume conv layer
+                    output = output[0]
+                elif len(output[0].shape)<=4: # the 4 is for attention heads
+                    output = torch.stack(output, dim=1)
+                elif len(output)==1:
+                    raise NotImplemented
+                    #output = output[0]
+                else:
+                    print(output[0].shape)
+                    raise NotImplemented
+                    #output = torch.cat(output, dim=1)
+            outputs[k].append(output)
+            comms_dict[k] = []
+    k = list(outputs.keys())[0]
+    if len(outputs[k])>1:
+        # Concat batches together
+        outputs = {k:torch.cat(v,dim=0) for k,v in outputs.items()}
+    else:
+        outputs = {k:v[0] for k,v in outputs.items()}
+    if to_cpu:
+        outputs = {k:v.cpu() for k,v in outputs.items()}
+
+    # Ensure we do not create a memory leak
+    for i in range(len(handles)):
+        handles[i].remove()
+    del handles
+
+    return outputs
+
+def fca_image_prep(X, og_shape=None, inverse=False):
+    """
+    X: torch tensor (B,C,H,W) or (B*C*W,C)
+    og_shape: tuple of ints
+        (batchsize,nchannels,height,width)
+    inverse: bool
+        whether to invert the image prep
+    """
+    if og_shape is not None and inverse:
+        X = X.reshape(-1, og_shape[2], og_shape[3], og_shape[1])
+        X = X.permute(0,3,1,2)
+        return X
+    X = X.permute(0,2,3,1)
+    return X.reshape(-1, X.shape[-1])
+
+def collect_activations_using_loader(
+        model,
+        data_loader,
+        layers=None,
+        comms_dict=None,
+        to_cpu=True,
+        ret_attns=False,
+        ret_preds=False,
+        tforce=False,
+        n_steps=0,
+        ret_gtruth=False,
+        verbose=False,):
+    """
+    Get the response from the argued layers in the model using a data
+    loader.
+
+    Args:
+        model: torch Module or torch gpu Module
+        data_loader: pytorch or huggingface dataloader
+            just some iterable over the model inputs
+        to_cpu: bool
+            If true, torch tensors will be placed onto the cpu.
+        ret_attn: bool
+            if true, will return the attention values as well.
+        ret_preds: bool
+            if true, will return the prediction ids under "pred_ids" and
+            logits under "logits"
+        tforce: bool
+            will use teacher forcing on all inputs if true. if false,
+            uses the task mask to determine when to teacher force.
+            false indices of the task mask indicate do teacher force.
+        n_steps: int
+            the number of additional steps to generate on top of the
+            initial input.
+        ret_gtruth: bool
+            if true, the model will return the ground truth pred_ids
+            where tmask is false
+    returns: 
+        comms_dict: dict
+            The keys will consist of the corresponding layer name. The
+            values will be the activations at that layer.
+
+            "layer_name": torch tensor (N, ...)
+    """
+    if comms_dict is None: comms_dict = dict()
+    if layers is None: layers = []
+
+    # Layers is modified to only the layers that were found in the model.
+    # If you argue a layer not found in the model, it will be ignored.
+    # There will, however, be a print statement that indicates that the
+    # layer was not found.
+    handles, layers = register_activation_hooks(
+        model=model, layers=layers, comms_dict=comms_dict, to_cpu=to_cpu,)
+
+    device = device_fxn(next(model.parameters()).get_device())
+    outputs = {key:[] for key in layers}
+    if ret_attns:
+        outputs["attentions"] = []
+    if ret_preds:
+        outputs["pred_ids"] = []
+        outputs["logits"] = []
+    if verbose: data_loader = tqdm(data_loader)
+    for batch in data_loader:
+        if type(batch)==dict:
+            batch = {k: v.to(device) for k,v in batch.items()}
+        elif type(batch)==tuple or type(batch)==list:
+            batch = batch[0].to(device)
+        elif type(batch)==torch.Tensor:
+            batch = batch.to(device)
+        try:
+            out_dict = model(
+                **batch,
+                output_attentions=ret_attns,
+                n_steps=n_steps,
+                ret_gtruth=ret_gtruth,
+                tforce=tforce,)
+        except:
+            try:
+                # Huggingface models
+                out_dict = model(**batch)
+            except:
+                out_dict = model(batch)
+        if ret_attns and type(out_dict)!=torch.Tensor:
+            outputs["attentions"].append(out_dict["attentions"][0])
+        if ret_preds:
+            if type(out_dict)!=torch.Tensor and "pred_ids" in out_dict:
+                outputs["logits"].append(out_dict["logits"])
+                outputs["pred_ids"].append(out_dict["pred_ids"])
+            elif hasattr(out_dict, "logits"):
+                outputs["logits"].append(out_dict.logits)
+                outputs["pred_ids"].append(torch.argmax(out_dict.logits, dim=-1))
+            else:
+                outputs["logits"].append(out_dict)
+                outputs["pred_ids"].append(torch.argmax(out_dict, dim=-1))
+        for k in layers:
+            output = comms_dict[k]
+            if type(output)==list: # There could be an internal for loop in model
+                if len(output)==0:
+                    print(k, "isn't producing")
+                    assert False
+                if len(output)==1 and len(output[0].shape)==4: # Assume conv layer
+                    output = output[0]
+                elif len(output[0].shape)<=4: # the 4 is for attention heads
                     output = torch.stack(output, dim=1)
                 elif len(output)==1:
                     raise NotImplemented
@@ -331,8 +485,6 @@ def save_json(data, file_name):
                 print("trying again")
                 failure = True
 
-
-
 def load_json_or_yaml(file_name):
     """
     Loads a json or a yaml file (determined by its extension) as a python
@@ -397,6 +549,8 @@ def get_command_line_args(args=None):
 
 def extract_ids(string, tokenizer):
     """
+    Returns the ids for the argued string
+
     Args:
         string: str
         tokenizer: Tokenizer object
@@ -410,84 +564,53 @@ def extract_ids(string, tokenizer):
         ids = ids[:-1]
     return ids
 
-def perform_pca(
-        X,
-        n_components=None,
-        scale=True,
-        center=True,
-        transform_data=False,
-        full_matrices=False,
-        randomized=False):
+def arglast(mask, dim=None, axis=-1):
     """
-    Perform PCA on the data matrix X
+    This function finds the index of the last max value along a given
+    dimension. torch.flip creates a copy of the tensor, so it's
+    actually not as efficient as using numpy's np.flip which only
+    returns a view.
 
     Args:
-        X: tensor (M,N)
-        n_components: int
-            optionally specify the number of components
-        scale: bool
-            if true, will scale the data along each column
-        transform_data: bool
-            if true, will compute and return the transformed
-            data
-        full_matrices: bool
-            determines if U will be returned as a square.
-        randomized: bool
-            if true, will use randomized svd for faster
-            computations
+        mask: bool (B,N)
+        dim: int
+    Returns:
+        the index of the last true value along the dimension
     """
-    if n_components is None:
-        n_components = X.shape[-1]
-        
-    svd_kwargs = {}
-    if type(X)==torch.Tensor:
-        if randomized:
-            svd_kwargs["q"] = n_components
-            svd = torch.svd_lowrank
-        else:
-            svd_kwargs["full_matrices"] = full_matrices
-            svd = torch.linalg.svd
-    elif type(X)==np.ndarray:
-        if randomized:
-            svd_kwargs["n_components"] = n_components
-            svd = randomized_svd
-        else:
-            svd_kwargs["n_components"] = n_components
-            svd_kwargs["compute_uv"] = True
-            svd = np.linalg.svd
-    assert not n_components or X.shape[-1]>=n_components
-    # Center the data by subtracting the mean along each feature (column)
-    means = torch.zeros_like(X[0])
-    if center:
-        means = X.mean(dim=0, keepdim=True)
-        X = X - means
-    stds = torch.ones_like(X[0])
-    if scale:
-        stds = (X.std(0)+1e-6)
-        X = X/stds
-    
-    
-    # Compute the SVD of the centered data
-    # X = U @ diag(S) @ Vh, where Vh contains the principal components as its rows
-    U, S, Vh = svd(X, **svd_kwargs)
-    
-    # The principal components (eigenvectors) are the first n_components rows of Vh
-    components = Vh[:n_components]
-    
-    # Explained variance for each component can be computed from the singular values
-    explained_variance = (S[:n_components] ** 2) / (X.shape[0] - 1)
-    prop_explained_variance = explained_variance/explained_variance.sum()
-    
-    ret_dict = {
-        "components": components,
-        "explained_variance": explained_variance,
-        "prop_explained_variance": prop_explained_variance,
-        "means": means,
-        "stds": stds,
-    }
-    if transform_data:
-        # Project the data onto the principal components
-        # Note: components.T has shape (features, n_components)
-        ret_dict["transformed_X"] = X @ components.T
+    if dim is None: dim = axis
+    if type(mask)==type(np.zeros(1)):
+        argmaxs = np.argmax(np.flip(mask, axis=dim), axis=dim)
+    else:
+        argmaxs = torch.argmax(torch.flip(mask, dims=(dim,)), dim=dim)
+    return mask.shape[dim] - argmaxs - 1
 
-    return ret_dict
+def get_output_size(model, layer_name, data_sample=None):
+    """
+    Returns the output size of the layer with the given name in the model.
+    
+    Args:
+        model: torch Module
+        layer_name: str
+            The name of the layer to get the output size from.
+        data_sample: dict or None
+            A sample of the data to use for determining the output size.
+            If None, the function will try to find the output size from the model
+            directly.
+    
+    Returns:
+        int: The output size of the layer.
+    """
+    if data_sample is not None:
+        with torch.no_grad():
+            return collect_activations(
+                model=model,
+                input_data=data_sample["input_ids"],
+                attention_mask=data_sample.get("attention_mask", None),
+                layers=[layer_name],
+                to_cpu=True
+            )[layer_name].shape[-1]
+
+    for name, module in model.named_modules():
+        if name == layer_name:
+            return module.out_features if hasattr(module, 'out_features') else module.weight.shape[-1]
+    raise ValueError(f"Failed to get output size for '{layer_name}'")

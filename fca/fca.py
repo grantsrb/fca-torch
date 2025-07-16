@@ -1,8 +1,11 @@
+import os
 import torch
 import torch.nn as nn
 import numpy as np
 import math
 from .schedulers import PlateauTracker
+from .projections import perform_pca, explained_variance
+from .utils import fca_image_prep, load_json_or_yaml
 
 
 def orthogonalize_vector(
@@ -115,6 +118,7 @@ class FunctionalComponentAnalysis(nn.Module):
                  orthogonalization_vectors=None,
                  init_rank=None,
                  init_vectors=None,
+                 init_noise=None,
                  orth_with_doubles=False,
                  *args, **kwargs):
         """
@@ -146,6 +150,8 @@ class FunctionalComponentAnalysis(nn.Module):
             init_vectors: None or list-like of tensors [(S,), ...]
                 Adds a list of vectors to the parameters list
                 without orthogonalizing them.
+            init_noise: None or float
+                Adds noise to the initialization vectors
             orth_with_doubles: bool
                 if true, will orthogonalize vectors in double precision.
                 This is useful for larger ranks, as the error increases
@@ -165,12 +171,14 @@ class FunctionalComponentAnalysis(nn.Module):
         # Orthogonalization matrix defines a matrix for which the FCs
         # need to be orthogonal to.
         self.orthogonalization_mtx = None
-        init_rank = 1 if init_rank is None else init_rank
-        for i in range(init_rank):
-            vec = None
-            if init_vectors is not None and i < len(init_vectors):
-                    vec = init_vectors[i]
-            self.add_component(vec)
+        self.init_vectors = init_vectors
+        self.init_noise = init_noise if init_noise is not None else 0.1
+        if init_vectors is not None and init_rank is None:
+            init_rank = len(init_vectors)
+        else:
+            init_rank = 1 if init_rank is None else init_rank
+        for _ in range(init_rank):
+            self.add_component()
         # If is_cached, the components are frozen in their orthogonal
         # normalized state. Can still track gradients.
         self.is_cached = False
@@ -187,6 +195,8 @@ class FunctionalComponentAnalysis(nn.Module):
         Means are used to center the representations before extracting
         functional components.
         """
+        if means is not None:
+            means = means.squeeze()
         self.register_buffer("means", means)
 
     def set_stds(self, stds):
@@ -194,6 +204,8 @@ class FunctionalComponentAnalysis(nn.Module):
         Standard deviations are used to scale the representations
         before extracting functional components.
         """
+        if stds is not None:
+            stds = stds.squeeze()
         self.register_buffer("stds", stds)
 
     def add_new_axis_parameter(self, init_vector=None):
@@ -213,8 +225,12 @@ class FunctionalComponentAnalysis(nn.Module):
         # Sample a new axis and add it to the parameter list
         if init_vector is not None:
             new_axis = init_vector.clone()
+        elif self.init_vectors is not None and self.rank<len(self.init_vectors):
+            new_axis = self.init_vectors[self.rank].clone()
         else:
             new_axis = torch.randn(self.size)
+        if self.init_noise is not None and self.init_noise>0:
+            new_axis += torch.randn(self.size) * self.init_noise
         p = nn.Parameter(new_axis).to(self.get_device())
         self.parameters_list.append(p)
         self.train_list.append(p)
@@ -240,6 +256,13 @@ class FunctionalComponentAnalysis(nn.Module):
         self.train_list = [p for p in self.train_list if p is not del_p]
         self.frozen_list = [p for p in self.frozen_list if p is not del_p]
         if was_cached: self.set_cached(True)
+
+    def remove_all_components(self):
+        """
+        Removes all functional components from the FCA.
+        """
+        for _ in range(self.rank-1):
+            self.remove_component()
 
     def update_orthogonalization_mtx(
             self,
@@ -559,7 +582,7 @@ class FunctionalComponentAnalysis(nn.Module):
             p.data = vec.data.clone().to(device)
         self.update_orthogonalization_mtx()
 
-    def get_forward_hook(self):
+    def get_forward_hook(self, comms_dict=None):
         """
         Returns a forward hook function to perform FCA on a desired
         module's outputs. Possible to use the `use_complement_in_hook`
@@ -567,18 +590,78 @@ class FunctionalComponentAnalysis(nn.Module):
         representation as opposed to using only the projected functional
         components.
 
+        Args:
+            comms_dict: dict or None
+                dict to collect activations before applying fca.
         Returns:
             hook: python function
         """
         def hook(module, input, output):
-            fca_vec = self(output)
-            stripped = self(fca_vec, inverse=True)
+            if type(output)!=torch.Tensor and "hidden_states" in output:
+                reps = output["hidden_states"]
+            elif type(output)!=torch.Tensor and hasattr(output, "hidden_states"):
+                reps = output.hidden_states
+            elif type(output)==tuple:
+                reps = output[0]
+            else:
+                reps = output
+
+            if comms_dict is not None:
+                comms_dict[self] = reps
+
+            stripped = self.projinv(reps)
             if self.use_complement_in_hook:
-                stripped = output - stripped
-            return stripped
+                stripped = reps - stripped
+            if type(output)!=torch.Tensor and "hidden_states" in output:
+                output["hidden_states"] = stripped
+            elif type(output)!=torch.Tensor and hasattr(output, "hidden_states"):
+                output.hidden_states = stripped
+            elif type(output)==tuple:
+                output = (stripped,) + output[1:]
+            else:
+                output = stripped
+            return output
+        return hook
+
+    def get_image_forward_hook(self, comms_dict=None):
+        """
+        Returns a forward hook function to perform FCA on a desired
+        module's outputs. Possible to use the `use_complement_in_hook`
+        field to subtract the projected functional components from the
+        representation as opposed to using only the projected functional
+        components.
+
+        Args:
+            comms_dict: dict or None
+                dict to collect activations before applying fca.
+        Returns:
+            hook: python function
+        """
+        def hook(module, input, output):
+            if type(output)!=torch.Tensor:
+                reps = output["hidden_states"]
+            else:
+                reps = output
+            if comms_dict is not None:
+                comms_dict[self] = reps
+
+            og_shape = reps.shape
+            reps = fca_image_prep(reps)
+
+            stripped = self.projinv(reps)
+            if self.use_complement_in_hook:
+                stripped = reps - stripped
+
+            stripped = fca_image_prep(stripped, og_shape=og_shape, inverse=True)
+
+            if type(output)!=torch.Tensor:
+                output["hidden_states"] = stripped
+            else:
+                output = stripped
+            return output
         return hook
     
-    def hook_model_layer(self, model, layer):
+    def hook_model_layer(self, model, layer, comms_dict=None, rep_type="language"):
         """
         Helper function to register the forward hook produced from
         `get_forward_hook` to the argued model's argued layer.
@@ -587,10 +670,24 @@ class FunctionalComponentAnalysis(nn.Module):
             model: torch Module
             layer: str
                 the layer to register the forward hook.
+            comms_dict: dict
+                dict to collect activations before applying fca
+            rep_type: str
+                the representation type. Valid options are
+                - "images": assumes latent shape of (B,C,H,W)
+                - "language": assumes latent shape of (B,S,D)
+                - "mlp": assumes latent shape of (B,D)
         """
         for mlayer,modu in model.named_modules():
             if layer==mlayer:
-                return modu.register_forward_hook(self.get_forward_hook())
+                if rep_type in {"image", "images"}:
+                    return modu.register_forward_hook(
+                        self.get_image_forward_hook(comms_dict=comms_dict)
+                    )
+                else:
+                    return modu.register_forward_hook(
+                        self.get_forward_hook(comms_dict=comms_dict)
+                    )
         return None
 
     def forward(self, x, inverse=False, components=None):
@@ -625,13 +722,31 @@ class FunctionalComponentAnalysis(nn.Module):
             x, self.make_fca_matrix(components=components).T
         )
     
+    def projinv(self, x, components=None):
+        """
+        Projects the input x into the functional component space
+        and returns the inverse projection back into the original
+        neural space.
+
+        Args:
+            x: torch Tensor (...,S)
+            components: torch Long Tensor
+                optionally argue a tensor indicating the components to
+                use based on their index in the fca matrix.
+        """
+        return self(
+            self(x, components=components),
+            inverse=True,
+            components=components
+        )
+    
     def interchange_intervention(self, trg, src):
         """
         Performs a Distributed Alignment Search interchange intervention
         using the fca matrix as defined in https://arxiv.org/abs/2501.06164.
         This cannot be used with Model Alignment Search!!
         """
-        return trg-self(self(trg),inverse=True)+self(self(src),inverse=True)
+        return trg-self.projinv(trg)+self.projinv(src)
 
     def find_sufficient_components(
         self,
@@ -668,6 +783,7 @@ class FunctionalComponentAnalysis(nn.Module):
                 argument and train till convergence.
         """
         plateau_tracker = PlateauTracker()
+        self.set_cached(True) # Will make fewer calls to gram-schmidt
         optimizer = torch.optim.Adam(self.parameters(), lr=lr)
 
         handle = self.hook_model_layer(model=model, layer=layer)
@@ -699,6 +815,7 @@ class FunctionalComponentAnalysis(nn.Module):
                 loss, acc = outputs["loss"], outputs["acc"]
                 loss.backward()
                 optimizer.step()
+                self.reset_cached_weight()
                 losses.append(loss.item())
                 accs.append(acc.item())
             metrics["train_loss"].append(np.mean(losses))
@@ -737,6 +854,9 @@ class FunctionalComponentAnalysis(nn.Module):
                 if new_component is None:
                     print("Reached max components, stopping process")
                     break
+
+                # Need to add new component to optimizer
+                optimizer = torch.optim.Adam(self.parameters(), lr=lr)
             
         if epoch==n_epochs and verbose:
             print("Stopping due to epoch limit")
@@ -822,7 +942,121 @@ class UnnormedFCA(FunctionalComponentAnalysis):
                 params.append(p)
         return self.frozen_list + params
 
+class PCAFunctionalComponentAnalysis(FunctionalComponentAnalysis):
+    """
+    A version of FCA that uses PCA as the functional components.
+    """
+    def __init__(self, X, scale=True, center=True, *args, **kwargs):
+        """
+        Args:
+            X: torch Tensor (N, S)
+                The input data to perform PCA on. This is used to
+                initialize the functional components.
+            scale: bool
+                If True, scales the data before performing PCA.
+            center: bool
+                If True, centers the data before performing PCA.
+            *args, **kwargs: additional arguments
+                These are passed to the FunctionalComponentAnalysis
+                constructor.
+        """
+        self.pca_info = self.perform_pca(
+            X=X, scale=scale, center=center, **kwargs, )
+        if "size" not in kwargs: kwargs["size"] = X.shape[-1]
+        super().__init__(
+            **kwargs,
+            means=self.pca_info.get("means", None),
+            stds=self.pca_info.get("stds", None),
+        )
+        self.set_cached(True)
+        self.update_parameters_with_pca(*args, **kwargs)
 
+    def proportion_expl_var(self, rank=None, actvs=None):
+        """
+        Returns the proportion of explained variance by the PCA components.
+        """
+        if rank is None: rank = self.max_rank
+        if actvs is None:
+            return self.pca_info["proportion_expl_var"][:rank].sum()
+        projinvs = self.projinv(actvs)
+        return explained_variance( preds=projinvs, labels=actvs, )
+
+    def update_parameters_with_pca(self, *args, **kwargs):
+        """ Updates the parameters of the FCA with PCA components. """
+        if self.rank > 1: self.remove_all_components()
+        vecs = self.pca_info["components"][:self.max_rank]
+        self.add_params_from_vector_list( vecs, overwrite=True )
+        self.cached_weight = torch.vstack(
+            [p for p in self.parameters_list]).to(self.get_device())
+
+    def set_max_rank(self, max_rank):
+        """
+        Updates the max rank of the PCAFunctionalComponentAnalysis.
+        This will reinitialize the components and orthogonalization vectors.
+        """
+        self.max_rank = max_rank
+        self.update_parameters_with_pca()
+
+    def perform_pca(self,
+        X,
+        scale=True,
+        center=True,
+        *args, **kwargs,
+    ):
+        """
+        Performs PCA on the input data and returns the principal components.
+
+        Args:
+            X: torch Tensor (N, S)
+                The input data to perform PCA on.
+            scale: bool
+                If True, scales the data before performing PCA.
+            center: bool
+                If True, centers the data before performing PCA.
+        Returns:
+            ret_dict: list of tensors [(S,), ...]
+                The principal components of the input data.
+        """
+        return perform_pca(
+            X=X,
+            n_components=None,
+            scale=scale,
+            center=center,
+            transform_data=False,
+            use_eigen=True,
+        )
+
+def load_fca_from_path(save_dir):
+    """
+    Loads a single FCA from a file path.
+
+    Args:
+        save_dir: str
+            The path to the FCA checkpoint save directory.
+    Returns:
+        fca: FunctionalComponentAnalysis
+            The loaded FCA object.
+    """
+    if not os.path.exists(save_dir):
+        raise FileNotFoundError(f"File not found: {save_dir}")
+    if not os.path.isdir(save_dir):
+        save_dir = "/".join(save_dir.split("/")[:-1])  # Remove the last part if it's a file
+    
+    # Load the FCA checkpoint
+    checkpt_path = os.path.join(save_dir, "fca_best.pt")
+    fca_state_dict = torch.load(checkpt_path, map_location="cpu")
+    config_path = os.path.join(save_dir, "fca_config.yaml")
+    fca_config = load_json_or_yaml(config_path)
+    
+    # Initialize the FCA object
+    kwargs = fca_config.get("fca_params", {})
+    fca = FunctionalComponentAnalysis(**kwargs)
+    fca.load_sd(fca_state_dict)
+    fca.update_parameters_no_grad()
+    fca.freeze_parameters()
+    fca.set_cached(True)
+    
+    return fca
 
 def load_fcas_from_path(file_path):
     fca_checkpoint = torch.load(file_path)
@@ -967,8 +1201,28 @@ def initialize_fcas(
             fca_parameters += list(fcas[name].parameters())
     return fcas, handles, fca_parameters
     
+def load_ortho_fcas(fca, fca_save_list):
+    """
+    Loads the orthogonalization vectors from a list of FCA objects.
+    This is useful for loading the orthogonalization vectors from a
+    previous or multiple FCA objects.
 
-__all__ = [ "FunctionalComponentAnalysis", "gram_schmidt", "orthogonalize_vector" ]
+    Args:
+        fca: FunctionalComponentAnalysis object
+            The FCA object to load the orthogonalization vectors into.
+        fca_save_list: list of FunctionalComponentAnalysis objects or save paths
+            The list of FCA objects to load the orthogonalization vectors from.
+    """
+    for prev_fca in fca_save_list:
+        if type(prev_fca) is str:
+            prev_fca = load_fca_from_path(prev_fca)
+        fca.add_excl_ortho_vectors(prev_fca.parameters_list)
+
+__all__ = [
+    "FunctionalComponentAnalysis", "gram_schmidt",
+    "orthogonalize_vector", "load_ortho_fcas",
+    "load_fca_from_path", "load_fcas_from_path",
+]
 
 # Example usage
 if __name__ == "__main__":
