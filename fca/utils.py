@@ -529,9 +529,9 @@ def str_to_typed_value(val):
         val = True
     elif val.lower()=="false":
         val = False
-    elif val.isdigit():
+    elif val.isnumeric():
         val = int(val)
-    elif val.isdecimal():
+    elif val.replace(".", "").isnumeric() and val.count(".")<=1:
         val = float(val)
     return val
 
