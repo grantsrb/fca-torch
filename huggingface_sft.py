@@ -95,7 +95,6 @@ def main(script_args, training_args, model_args):
     valid_image_text_architectures = MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES.values()
 
     if config.architectures and any(arch in valid_image_text_architectures for arch in config.architectures):
-
         model_kwargs.pop("use_cache", None)  # Image models do not support cache
         model = AutoModelForImageTextToText.from_pretrained(model_args.model_name_or_path, **model_kwargs)
     else:
@@ -124,7 +123,7 @@ def main(script_args, training_args, model_args):
         train_dataset=dataset[script_args.dataset_train_split],
         eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
         processing_class=tokenizer,
-        peft_config=get_peft_config(model_args),
+        #peft_config=get_peft_config(model_args),
     )
 
     trainer.train()
