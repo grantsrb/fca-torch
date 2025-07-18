@@ -148,8 +148,8 @@ class FunctionalComponentAnalysis(nn.Module):
                 excluded from the functional components but are
                 included for orthogonality calculations.
             init_vectors: None or list-like of tensors [(S,), ...]
-                Adds a list of vectors to the parameters list
-                without orthogonalizing them.
+                Adds a list of vectors to initialize new components
+                from.
             init_noise: None or float
                 Adds noise to the initialization vectors
             orth_with_doubles: bool
