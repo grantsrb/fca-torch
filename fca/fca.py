@@ -609,7 +609,15 @@ class FunctionalComponentAnalysis(nn.Module):
             if comms_dict is not None:
                 comms_dict[self] = reps
 
-            stripped = self.projinv(reps)
+            #if next(self.parameters()).get_device()!=reps.get_device():
+            #    self.to(reps.get_device())
+
+            try:
+                stripped = self.projinv(reps)
+            except RuntimeError as e:
+                self.to(reps.get_device())
+                stripped = self.projinv(reps)
+
             if self.use_complement_in_hook:
                 stripped = reps - stripped
             if type(output)!=torch.Tensor and "hidden_states" in output:
