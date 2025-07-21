@@ -177,6 +177,7 @@ if __name__ == "__main__":
                 actvs=fca_image_prep(outputs[layer][samp].to(device)),
             ).mean().item()
             print(f"Explained Variance: {expl_var}")
+
         actvs = {pc_fca: [] for pc_fca in pc_fcas}
         avg_acc = 0.0
         n_loops = len(val_dataset) // config["val_batch_size"]

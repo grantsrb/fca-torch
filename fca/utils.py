@@ -66,7 +66,19 @@ def register_activation_hooks(
         layers,
         comms_dict,
         to_cpu=True):
-    """Helper function to register forward hooks at multiple layers"""
+    """
+    Helper function to register forward hooks at multiple layers
+
+    Args:
+        model: torch Module
+            The model to register the hooks on.
+        layers: list of str
+            The names of the layers to register the hooks on.
+        comms_dict: dict
+            A dictionary to store the activations collected by the hooks.
+        to_cpu: bool
+            If True, the activations will be moved to CPU after collection.
+    """
     handles = []
     hooked_layers = set()
     for name, mod in model.named_modules():

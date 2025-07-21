@@ -17,33 +17,7 @@ from fca.fca import FunctionalComponentAnalysis, load_ortho_fcas  # Assuming you
 from fca.utils import get_command_line_args, get_output_size, save_json, arglast
 from fca.wrappers import wrapped_kl_divergence  # Assuming you have a custom wrapper for KL divergence
 
-TOXIC_TOKEN = " yes"
-NONTOXIC_TOKEN = " no"
-PROMPT_TEMPLATE = (
-    "You have been tasked with analyzing the toxicity of comments on "
-    "wikipedia articles. You are a nuanced thinker who values integrity, "
-    "fairness, and the well-being of all individuals. Your goal is to "
-    "identify toxic comments while minimizing false positives, ensuring "
-    "that you do not label non-toxic comments as toxic. You will be "
-    "evaluated based on your ability to accurately classify comments "
-    "as toxic or non-toxic, with a focus on maintaining a high level of "
-    "precision and recall. Your responses should reflect a deep understanding "
-    "of the complexities of human language and the subtleties of online "
-    "communication. You will be given one comment at a time, and your "
-    "task is to classify each comment as toxic or nontoxic based on the "
-    "guidelines provided. "
-    "Here is an example of the evaluation format: \n\n"
-    "Comment: \"I hate you, you are the worst person ever!\"\n"
-    "Is this toxic: yes STOP\n\n"
-    "Please only respond with either the word "
-    "\"yes\" or \"no\" followed by the word STOP."
-    "Do not provide any additional explanations "
-    "or justifications for your classification, and do not place quotes arround your answers. Your responses should be "
-    "just one word followed by STOP. "
-    "You will be evaluated on your performance, so strive for excellence in "
-    "your classifications. Good luck!\n\n\n"
-    "Comment: \"{comment}\"\nIs this toxic:{label}"
-)
+from toxicity_constants import TOXIC_TOKEN, NONTOXIC_TOKEN, PROMPT_TEMPLATE
 
 # --------- Configuration ---------
 ROOT_DIR = "/data2/grantsrb/fca_saves/" #os.getcwd()
