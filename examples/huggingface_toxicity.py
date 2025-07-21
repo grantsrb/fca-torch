@@ -47,9 +47,9 @@ PROMPT_TEMPLATE = (
 
 # --------- Configuration ---------
 ROOT_DIR = "/data2/grantsrb/fca_saves/" #os.getcwd()
-MODEL_NAME = "Qwen/Qwen3-14B" #"openai-community/gpt2" #"distilbert/distilbert-base-uncased" #
+MODEL_NAME = "deepseek-ai/DeepSeek-R1-Distill-Llama-8B" #"Qwen/Qwen3-14B" #"openai-community/gpt2" #"distilbert/distilbert-base-uncased" #
 BATCH_SIZE = 16
-TARGET_LAYER_NAME = "transformer.h.5"
+TARGET_LAYER_NAME = "model.layers.15"
 TOLERANCE = 0.01
 PATIENCE = 3
 LEARNING_RATE = 1e-4
@@ -103,6 +103,8 @@ if __name__ == "__main__":
         "dataset": DATASET_NAME,
         "ortho_fcas": None,  # Path to orthogonal FCA components if any
         "debugging": False,
+        "reduce_init_eval_data": True, # if true, will reduce the amount
+            # of data used to initially evaluate the model
         "use_model_labels": False,  # Use model predictions as labels
         "compl_eps": 0.0,  # Weight for complement loss, set to 0.0 to disable
         "max_components": math.inf,  # Maximum number of components to learn
@@ -260,6 +262,8 @@ if __name__ == "__main__":
                   f"Precision={precision/max(1,total_precision):.4f}, Recall={recall/max(1,total_recall):.4f}", end=" "*20+"\r")
             if config.get("debugging", False) and i >= 10:
                 break
+            if config.get("reduce_init_eval_data", False) and i >= 30:
+                break
         avg_loss = total_loss / len(dataloader)
         avg_match = total_match / len(dataloader)
         avg_precision = precision / max(1,total_precision)
@@ -291,6 +295,11 @@ if __name__ == "__main__":
     if "ortho_fcas" in config and config["ortho_fcas"]:
         fca = load_ortho_fcas(fca, config["ortho_fcas"])
     fca.to(DEVICE)
+
+    if next(fca.parameters()).dtype != model.dtype:
+        print("Warning: FCA parameters dtype does not match model dtype. "
+              "Converting FCA parameters to model dtype.")
+        fca = fca.to(model.dtype)
 
     comms_dict = dict()
     hook = fca.hook_model_layer(
@@ -345,7 +354,7 @@ if __name__ == "__main__":
             logits = model(**model_kwargs).logits
             if config.get("debugging", False):
                 print("Pre Logit Preparation:")
-                print("Logits:", logits[0, batch["ans_idx"][0], :].cpu().detach().numpy())
+                print("Logits:", logits[0, batch["ans_idx"][0], :].float().cpu().detach().numpy())
                 print("Targets:", targets[0], "Labels:", labels[0])
                 print("Input IDs:", batch["input_ids"][0][:300])
                 print("Answer Index:", batch["ans_idx"][0].item())
@@ -357,7 +366,7 @@ if __name__ == "__main__":
 
             if config.get("debugging", False):
                 print("Post Logit Preparation:")
-                print("Logits:", logits[0, :].cpu().detach().numpy())
+                print("Logits:", logits[0, :].float().cpu().detach().numpy())
                 print("Targets:", targets[0], "Labels:", labels[0])
                 print("Loss:", loss.item())
 
@@ -389,10 +398,13 @@ if __name__ == "__main__":
             loss = eps*compl_loss + (1-eps)*loss
             try:
                 loss.backward()
-                optimizer.step()
-                optimizer.zero_grad()
             except RuntimeError as e:
                 print("Failed to backpropagate due to:", e)
+            try:
+                optimizer.step()
+            except RuntimeError as e:
+                print("Failed to optimize due to:", e)
+            optimizer.zero_grad()
             fca.reset_cached_weight()
 
             print(f"Batch {bi+1}/{len(dataloader)}: Loss={loss.item():.4f}, Acc={acc:.4f}, "
