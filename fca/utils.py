@@ -626,3 +626,30 @@ def get_output_size(model, layer_name, data_sample=None):
         if name == layer_name:
             return module.out_features if hasattr(module, 'out_features') else module.weight.shape[-1]
     raise ValueError(f"Failed to get output size for '{layer_name}'")
+
+def save_model_checkpt(
+        model,
+        save_path,
+        config=None,
+):
+    """
+    Saves the model statedict and the configuration dict
+
+    Args:
+        model: torch Module or hf model
+        save_path: str
+            path without extension
+        config: dict
+    """
+    if config is not None:
+        config_path = save_path + "_config.json"
+        save_json(config, config_path)
+    try: # huggingface model
+        model.save_pretrained(save_path, from_pt=True)
+    except:
+        torch.save(
+            model.state_dict(),
+            save_path + ".pt"
+        )
+
+
