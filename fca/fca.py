@@ -314,7 +314,6 @@ class FunctionalComponentAnalysis(nn.Module):
             self.excl_ortho_list.append(v)
         rank_diff = self.size-len(self.excl_ortho_list)
         self.max_rank = min(self.max_rank, rank_diff)
-        print("New Max Rank:", self.max_rank)
         self.update_orthogonalization_mtx()
 
     def add_orthogonalization_vectors(self, new_vectors):
@@ -986,14 +985,25 @@ class PCAFunctionalComponentAnalysis(FunctionalComponentAnalysis):
         if rank is None: rank = self.max_rank
         if actvs is None:
             return self.pca_info["proportion_expl_var"][:rank].sum()
-        projinvs = self.projinv(actvs)
+        if rank>self.max_rank:
+            rank = self.max_rank
+            print("Reducing rank to max rank", rank)
+        components = torch.arange(rank).long()
+        projinvs = self.projinv(actvs, components=components)
         return explained_variance( preds=projinvs, labels=actvs, )
 
     def update_parameters_with_pca(self, *args, **kwargs):
         """ Updates the parameters of the FCA with PCA components. """
-        if self.rank > 1: self.remove_all_components()
+        if self.rank > 1:
+            old_list = [p for p in self.parameters_list[1:]]
+            new_list = [self.parameters_list[0]]
+            self.parameters_list = nn.ParameterList(new_list)
+            self.train_list = [p for p in self.train_list if p is new_list[0]]
+            self.frozen_list = [p for p in self.frozen_list if p is new_list[0]]
+            for p in old_list: del p
         vecs = self.pca_info["components"][:self.max_rank]
-        self.add_params_from_vector_list( vecs, overwrite=True )
+        self.add_params_from_vector_list(
+            vecs, overwrite=True )
         self.cached_weight = torch.vstack(
             [p for p in self.parameters_list]).to(self.get_device())
 
@@ -1005,10 +1015,13 @@ class PCAFunctionalComponentAnalysis(FunctionalComponentAnalysis):
         self.max_rank = max_rank
         self.update_parameters_with_pca()
 
-    def perform_pca(self,
+    def perform_pca(
+        self,
         X,
         scale=True,
         center=True,
+        max_sample_size=10000,
+        batch_size=None,
         *args, **kwargs,
     ):
         """
@@ -1021,16 +1034,27 @@ class PCAFunctionalComponentAnalysis(FunctionalComponentAnalysis):
                 If True, scales the data before performing PCA.
             center: bool
                 If True, centers the data before performing PCA.
+            batch_size: none or int
+                optionally argue a batch size for the covariance matrix
+                calculations
         Returns:
             ret_dict: list of tensors [(S,), ...]
                 The principal components of the input data.
         """
+        if max_sample_size and len(X)>max_sample_size:
+            if type(X)!=np.ndarray:
+                perm = torch.randperm(len(X))[:max_sample_size].long()
+            else:
+                perm = np.random.permutation(len(X))[:max_sample_size]
+            X = X[perm]
+
         return perform_pca(
             X=X,
             n_components=None,
             scale=scale,
             center=center,
             transform_data=False,
+            batch_size=batch_size,
             use_eigen=True,
         )
 

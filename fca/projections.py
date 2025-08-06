@@ -116,6 +116,75 @@ def component_wise_expl_var(actvs, weight, eps=1e-6):
         cumu_expl_vars.append(torch.zeros_like(cumu_expl_vars[-1]))
     return torch.stack(expl_vars), torch.stack(cumu_expl_vars)
 
+def get_cor_mtx(X, Y, batch_size=500, to_numpy=False, zscore=True, device=None):
+    """
+    Creates a correlation matrix for X and Y using the GPU
+
+    X: torch tensor or ndarray (T, C) or (T, C, H, W)
+    Y: torch tensor or ndarray (T, K) or (T, K, H1, W1)
+    batch_size: int
+        batches the calculation if this is not None
+    to_numpy: bool
+        if true, returns matrix as ndarray
+    zscore: bool
+        if true, both X and Y are normalized over the T dimension
+    device: int
+        optionally argue a device to use for the matrix multiplications
+
+    Returns:
+        cor_mtx: (C,K) or (C*H*W, K*H1*W1)
+            the correlation matrix
+    """
+    if len(X.shape) < 2:
+        X = X[:,None]
+    if len(Y.shape) < 2:
+        Y = Y[:,None]
+    if len(X.shape) > 2:
+        X = X.reshape(len(X), -1)
+    if len(Y.shape) > 2:
+        Y = Y.reshape(len(Y), -1)
+    if type(X) == type(np.array([])):
+        to_numpy = True
+        X = torch.FloatTensor(X)
+        Y = torch.FloatTensor(Y)
+    if device is None:
+        device = X.get_device()
+        if device<0: device = "cpu"
+    if zscore:
+        xmean = X.mean(0)
+        xstd = torch.sqrt(((X-xmean)**2).mean(0))
+        ymean = Y.mean(0)
+        ystd = torch.sqrt(((Y-ymean)**2).mean(0))
+        xstd[xstd<=0] = 1
+        X = (X-xmean)/(xstd+1e-5)
+        ystd[ystd<=0] = 1
+        Y = (Y-ymean)/(ystd+1e-5)
+    X = X.permute(1,0)
+
+    with torch.no_grad():
+        if batch_size is None:
+            X = X.to(device)
+            Y = Y.to(device)
+            cor_mtx = torch.einsum("it,tj->ij", X, Y).detach().cpu()
+        else:
+            cor_mtx = []
+            for i in range(0,len(X),batch_size): # loop over x neurons
+                sub_mtx = []
+                x = X[i:i+batch_size].to(device)
+
+                # Loop over y neurons
+                for j in range(0,Y.shape[1], batch_size):
+                    y = Y[:,j:j+batch_size].to(device)
+                    cor_block = torch.einsum("it,tj->ij",x,y)
+                    cor_block = cor_block.detach().cpu()
+                    sub_mtx.append(cor_block)
+                cor_mtx.append(torch.cat(sub_mtx,dim=1))
+            cor_mtx = torch.cat(cor_mtx, dim=0)
+    cor_mtx = cor_mtx/len(Y)
+    if to_numpy:
+        return cor_mtx.numpy()
+    return cor_mtx
+
 def perform_pca(
         X,
         n_components=None,
@@ -125,6 +194,7 @@ def perform_pca(
         full_matrices=False,
         randomized=False,
         use_eigen=True,
+        batch_size=None,
         verbose=True,
 ):
     """
@@ -147,6 +217,9 @@ def perform_pca(
         use_eigen: bool
             if true, will use an eigen decomposition on the
             covariance matrix of X to save compute
+        batch_size: int or None
+            optionally argue a batch size. only applies if use_eigen
+            is true.
     Returns:
         ret_dict: dict
             A dictionary containing the following keys:
@@ -171,6 +244,7 @@ def perform_pca(
             scale=scale,
             center=center,
             transform_data=transform_data,
+            batch_size=batch_size,
             verbose=verbose,
         )
     if n_components is None:
@@ -237,6 +311,7 @@ def perform_eigen_pca(
         scale=True,
         center=True,
         transform_data=False,
+        batch_size=None,
         verbose=True,
 ):
     """
@@ -272,7 +347,6 @@ def perform_eigen_pca(
     if n_components is None:
         n_components = X.shape[-1]
         
-    svd_kwargs = {}
     if type(X)==torch.Tensor:
         eigen_fn = torch.linalg.eigh
     elif type(X)==np.ndarray:
@@ -289,9 +363,13 @@ def perform_eigen_pca(
         stds = (X.std(0)+1e-6)
         X = X/stds
     
-    # Use eigendecomposition of the covariance matrix for efficiency
-    # Cov = (1 / (M - 1)) * X^T X
-    cov = X.T @ X / (X.shape[0] - 1)  # shape (N, N)
+    cov = get_cor_mtx(
+        X,X,
+        zscore=False,
+        batch_size=batch_size)
+    ## Use eigendecomposition of the covariance matrix for efficiency
+    ## Cov = (1 / (M - 1)) * X^T X
+    #cov = X.T @ X / (X.shape[0] - 1)  # shape (N, N)
 
     # Compute eigenvalues and eigenvectors
     eigvals, eigvecs = eigen_fn(cov)  # eigvals in ascending order
