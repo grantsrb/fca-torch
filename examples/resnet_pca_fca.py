@@ -224,17 +224,14 @@ if __name__ == "__main__":
     if config.get("debugging", False):
         print(df.head())
     else:
-        save_folder = config.get("save_folder", "results")
+        save_folder = config.get("save_folder", f"results")
         if not os.path.exists(save_folder):
             os.makedirs(save_folder)
+        dtime = datetime.now().strftime("d%Y-%m-%d_t%H-%M-%S")
         save_name = os.path.join(
             save_folder,
-            config.get("save_name", "resnet_fca_metrics.csv"),
+            config.get("save_name", "resnet_fca_metrics_{dtime}.csv"),
         )
-        if os.path.exists(save_name) and not overwrite:
-            prev_df = pd.read_csv(save_name)
-            df = pd.concat([prev_df, df], ignore_index=True)
-        else:
-            print(f"Saving metrics to {save_name}")
+        print(f"Saving metrics to {save_name}")
         df.to_csv(save_name, index=False, header=True)
         print("Metrics saved to {save_name}")
