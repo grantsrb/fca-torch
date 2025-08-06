@@ -268,6 +268,77 @@ def fca_image_prep(X, og_shape=None, inverse=False):
     X = X.permute(0,2,3,1)
     return X.reshape(-1, X.shape[-1])
 
+def pad_list_to(arr, tot_len, fill_val=0, side="right"):
+    """
+    Pads the argued array to the goal length. Operates in place.
+
+    Args:
+        arr: list
+        tot_len: int
+            the length to pad to
+        fill_val: int
+            the symbol to use for the padding
+        side: str
+            pad on the left side or the right
+    Returns:
+        arr: list
+            the padded list
+    """
+    n_pad = tot_len - len(arr)
+    if n_pad<=0: return arr
+    if side=="right":
+        for i in range(n_pad):
+            arr.append(fill_val)
+    else:
+        padding = [fill_val for _ in range(n_pad)]
+        arr = padding + arr
+    return arr
+
+def pad_to(arr, tot_len, fill_val=0, side="right", dim=-1):
+    """
+    Pads the argued list to the goal length along a single dimension.
+
+    Args:
+        arr: list or ndarray or torch tensor
+            cannot take a mixture of datatypes. If list is argued,
+            must be 1 dimensional list. Cannot take 2d list.
+        tot_len: int
+            the length of the resulting array
+        fill_val: object
+            the value to use for the padding
+        side: str
+            pad on the left side or the right
+    Returns:
+        arr: list
+            the padded list
+    """
+    if type(arr)==list:
+        return pad_list_to(
+            arr,
+            tot_len=tot_len,
+            fill_val=fill_val,
+            side=side,
+        )
+    if dim<0: dim = len(arr.shape) + dim
+    n_pad = tot_len - arr.shape[dim]
+    if n_pad<=0: return arr
+    tup = (0,n_pad) if side=="right" else (n_pad, 0)
+    if type(arr)==type(np.zeros((1,))):
+        pad_tups = [
+            (0,0) if i!= dim else tup for i in range(len(arr.shape))
+        ]
+        arr = np.pad(arr, pad_tups, constant_values=fill_val)
+    elif type(arr)==type(torch.zeros(1)):
+        pad_tup = [0 for _ in range(2*len(arr.shape))]
+        # PyTorch decided to make things complicated by reversing the
+        # order that the tuple refers to
+        pad_tup[-2*(dim+1)+int(side=="right")] = n_pad
+        arr = torch.nn.functional.pad(
+            arr, tuple(pad_tup), value=fill_val
+        )
+    return arr
+
+
 def collect_activations_using_loader(
         model,
         data_loader,
@@ -279,6 +350,7 @@ def collect_activations_using_loader(
         tforce=False,
         n_steps=0,
         ret_gtruth=False,
+        padding_side="right",
         verbose=False,):
     """
     Get the response from the argued layers in the model using a data
@@ -302,6 +374,9 @@ def collect_activations_using_loader(
         n_steps: int
             the number of additional steps to generate on top of the
             initial input.
+        padding_side: str
+            "right" or "left" to determine padding on dim=2 when 4d
+            outputs
         ret_gtruth: bool
             if true, the model will return the ground truth pred_ids
             where tmask is false
@@ -384,7 +459,18 @@ def collect_activations_using_loader(
     k = list(outputs.keys())[0]
     if len(outputs[k])>1:
         # Concat batches together
-        outputs = {k:torch.cat(v,dim=0) for k,v in outputs.items()}
+        try:
+            outputs = {k:torch.cat(v,dim=0) for k,v in outputs.items()}
+        except:
+            print("Attemping padding")
+            pad_tos = {
+                k: max([v.shape[2] for v in vals]) for k,vals in outputs.items()
+            }
+            outputs = {
+                k: torch.cat(
+                    [pad_to(v, pad_tos[k], side=padding_side, dim=2) for v in vals],
+                dim=0) for k,vals in outputs.items()
+            }
     else:
         outputs = {k:v[0] for k,v in outputs.items()}
     if to_cpu:
@@ -421,6 +507,31 @@ def load_json(file_name):
         s = f.read()
         j = json.loads(s)
     return j
+
+def load_model_config(path):
+    """
+    Args:
+        path: str
+            Assumes the model config is located one directory up from the
+            end point argued in the path.
+    Returns:
+        config: dict
+    """
+    if not path: return None
+    if "config." in path:
+        return load_json_or_yaml(path)
+    if not os.path.isdir(path):
+        path = "/".join(path.split("/")[:-1])
+    if path.split("/")[-1] in {"model_checkpt", "best_model_checkpt"}:
+        path = "/".join(path.split("/")[:-1])
+    for f in os.listdir(path):
+        if ".json" in f or ".yaml" in f:
+            if "best" in path and "best_model_checkpt_config" in f:
+                return load_json_or_yaml(os.path.join(path,f))
+            elif "model_checkpt_config" in f:
+                return load_json_or_yaml(os.path.join(path,f))
+    return None
+    
 
 def default_to_list(val, n_el):
     """
