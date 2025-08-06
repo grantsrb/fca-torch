@@ -1,7 +1,7 @@
 import os
 import csv
 import yaml
-import math
+import time
 from datetime import datetime
 import torch
 import torch.nn as nn
@@ -14,23 +14,28 @@ from transformers import (
 from datasets import load_dataset, concatenate_datasets
 
 from fca.fca import FunctionalComponentAnalysis, load_ortho_fcas  # Assuming you have a custom FCA module
-from fca.utils import get_command_line_args, get_output_size, save_json, arglast
+from fca.utils import (
+    get_command_line_args, get_output_size, save_json, arglast,
+    load_model_config,
+)
 from fca.wrappers import wrapped_kl_divergence  # Assuming you have a custom wrapper for KL divergence
 
 from toxicity_constants import TOXIC_TOKEN, NONTOXIC_TOKEN, PROMPT_TEMPLATE
+
+import pandas as pd
 
 # --------- Configuration ---------
 ROOT_DIR = "/data2/grantsrb/fca_saves/" #os.getcwd()
 MODEL_NAME = "deepseek-ai/DeepSeek-R1-Distill-Llama-8B" #"Qwen/Qwen3-14B" #"openai-community/gpt2" #"distilbert/distilbert-base-uncased" #
 BATCH_SIZE = 16
-TARGET_LAYER_NAME = "model.layers.15"
+TARGET_LAYER_NAME = "transformer.h.5" # "model.layers.15"
 TOLERANCE = 0.01
 PATIENCE = 3
 LEARNING_RATE = 1e-4
 LOG_EVERY = 2
 MAX_EPOCHS = 100
 DATASET_NAME = 'anitamaxvim/jigsaw-toxic-comments' #"Johnesss/Jigsaw-Toxic-Comment-Classification"  # replace with 'jigsaw-toxic-comment-classification' if using a local version
-RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
+RUN_ID = datetime.now().strftime("d%Y-%m-%d_t%H-%M-%S")
 LABEL_KEYS = [
     "toxic", "severe_toxic", "obscene", "threat", "insult",
     "identity_hate"
@@ -42,7 +47,7 @@ DEVICE2 = available_devices[-1] if torch.cuda.is_available() else "cpu"
 def balance_dataset(dataset, seed=42):
     # Count the distribution of labels
     toxic_count = sum(
-        sum(item[key] for key in LABEL_KEYS) > 0 for item in dataset
+        (sum(item[key] for key in LABEL_KEYS) > 0) for item in dataset
     )
     nontoxic_count = len(dataset) - toxic_count
     if toxic_count > nontoxic_count:
@@ -63,12 +68,106 @@ def balance_dataset(dataset, seed=42):
         dataset = concatenate_datasets([ toxic, nontoxic ])
     return dataset.shuffle(seed=seed)
 
+def forward_pass(
+    model,
+    dataloader,
+    config,
+    criterion=nn.CrossEntropyLoss(),
+    fca=None,
+    optimizer=None,
+    is_validation=False,
+):
+    prev_grad_state = torch.is_grad_enabled()
+    torch.set_grad_enabled(not is_validation)
+    total_loss, total_match, total_precision, total_recall = 0.0, 0.0, 0.0, 0.0
+    toxic_count, total_count = 0, 0
+    recall = 0.0
+    precision = 0.0
+    for i,batch in enumerate(dataloader):
+        start_time = time.time()
+        if fca is not None:
+            fca.use_complement_in_hook = False
+        inputs = {k: v.to(DEVICE) for k, v in batch.items()}
+        model_kwargs = {"input_ids": inputs["input_ids"],
+                        "attention_mask": inputs["attention_mask"]}
+        logits = model(**model_kwargs).logits
+        logits = prep_logits( logits, inputs["ans_idx"] )
+
+        labels = inputs["targets"].long()
+        loss = criterion(logits, labels)/config.get("grad_accumulation_steps", 1)
+
+        # Track the complement loss
+        compl_loss = torch.tensor(0.0, device=logits.device)
+        eps = config.get("compl_eps", 0)
+        if eps > 0 and fca is not None:
+            fca.use_complement_in_hook = True
+            compl_logits = prep_logits(
+                model(**model_kwargs).logits,
+                ans_idx=batch["ans_idx"]
+            )
+            fca.use_complement_in_hook = False
+            compl_labels = 0.5*torch.ones_like(compl_logits)
+            compl_loss = wrapped_kl_divergence(
+                compl_logits, compl_labels, preds_are_logits=True)
+
+        loss = eps*compl_loss + (1-eps)*loss
+
+        if not is_validation:
+            try:
+                loss.backward()
+            except RuntimeError as e:
+                print("Failed to backpropagate due to:", e)
+            if i % config.get("grad_accumulation_steps", 1) == 0:
+                if optimizer is not None:
+                    optimizer.step()
+                    optimizer.zero_grad()
+                if fca is not None:
+                    fca.reset_cached_weight()
+
+        total_loss += loss.item()
+        match = (logits.argmax(-1) == labels)
+        acc = match.float().mean().item()
+        total_match += acc
+
+        labels = inputs["targets"].long()
+        precision +=  match[logits.argmax(-1)==1].float().sum().item()
+        total_precision += (logits.argmax(-1)==1).float().sum().item()
+        recall +=  match[labels==1].float().sum().item()
+        total_recall += (labels==1).float().sum().item()
+
+        toxic_count += inputs["targets"].long().sum().item()
+        total_count += len(inputs["targets"])
+        run_time = time.time()-start_time
+        print(f"Batch {i+1}/{len(dataloader)}: Loss={loss.item():.4f}, Acc={acc:.4f}, "
+              f"Precision={precision/max(1,total_precision):.4f}, Recall={recall/max(1,total_recall):.4f}, "
+              f"Exec Time: {run_time:.4f}",
+              end=" "*20+"\r")
+        if config.get("small_data", False) and i >= 10:
+            break
+    print()
+
+    avg_loss = total_loss / len(dataloader)
+    avg_match = total_match / len(dataloader)
+    avg_precision = precision / max(1,total_precision)
+    avg_recall = recall / max(1,total_recall)
+    toxic_proportion = toxic_count/total_count
+    torch.set_grad_enabled(prev_grad_state)
+
+    return {
+        "avg_loss": avg_loss,
+        "avg_match":  avg_match,
+        "avg_precision":  avg_precision,
+        "avg_recall":  avg_recall,
+        "toxic_proportion": toxic_proportion,
+    }
+
 if __name__ == "__main__":
     print("Running Hugging Face Toxicity Example...")
     config = {
         "root_dir": ROOT_DIR,
         "seed": 42,  # Random seed for reproducibility, also the meaning of life, the universe, and everything
         "model_name": MODEL_NAME,
+        "tokenizer_name": None,
         "batch_size": BATCH_SIZE,
         "target_layer": TARGET_LAYER_NAME,
         "tolerance": TOLERANCE,
@@ -81,14 +180,34 @@ if __name__ == "__main__":
             # of data used to initially evaluate the model
         "use_model_labels": False,  # Use model predictions as labels
         "compl_eps": 0.0,  # Weight for complement loss, set to 0.0 to disable
-        "max_components": math.inf,  # Maximum number of components to learn
+
+        "initial_rank": 300,
+        "components_per_incr": 10, # how many components to increase the
+            # FCA by with every performance plateau
+        "max_components": 384, # how many components to increase the
+            # FCA by with every performance plateau
     }
     config.update(get_command_line_args())
 
-    # --------- Logging Setup ---------
+    # --------- Logging and Config Setup ---------
     ROOT_DIR = config["root_dir"]
     MODEL_NAME = config["model_name"]
-    LOG_DIR = f"{ROOT_DIR}/fca_{MODEL_NAME}/run_{RUN_ID}"
+    TOKENIZER_NAME = config.get("tokenizer_name", None)
+    if os.path.isdir(MODEL_NAME) or os.path.exists(MODEL_NAME):
+        mconfig = load_model_config(MODEL_NAME)
+        TOKENIZER_NAME = mconfig.get("tokenizer_name", mconfig["model_name"])
+        if TOKENIZER_NAME is None:
+            TOKENIZER_NAME = mconfig["model_name"]
+    if TOKENIZER_NAME is None:
+        TOKENIZER_NAME = MODEL_NAME
+
+    dir_model_name = MODEL_NAME
+    if ROOT_DIR in dir_model_name:
+        dir_model_name = dir_model_name.split(ROOT_DIR)[-1]
+    dir_model_name = dir_model_name.replace("/", "-")
+    BASE_DIR = os.path.join(ROOT_DIR, f"fca_{dir_model_name}")
+    config["base_dir"] = BASE_DIR
+    LOG_DIR = os.path.join(BASE_DIR, f"run_{RUN_ID}")
     config["log_dir"] = LOG_DIR
     os.makedirs(LOG_DIR, exist_ok=True)
 
@@ -97,10 +216,20 @@ if __name__ == "__main__":
         writer = csv.writer(csvfile)
         writer.writerow(["epoch", "avg_loss", "behavior_match", "n_components"])
 
+    config["small_data"] = config.get("small_data", False) or config.get("debugging", False)
+
+
     # --------- Dataset & Tokenizer ---------
-    dataset = load_dataset(config["dataset"], split="train")
+
+    if config["small_data"]:
+        dataset = load_dataset(config["dataset"], split="train[:1000]")
+        val_dataset = load_dataset(config["dataset"], split="test[:1000]")
+    else:
+        dataset = load_dataset(config["dataset"], split="train")
+        val_dataset = load_dataset(config["dataset"], split="test")
     print("Dataset loaded:", config["dataset"])
     dataset = dataset.rename_column("comment_text", "text")
+    val_dataset = val_dataset.rename_column("comment_text", "text")
 
     # Filter dataset to have balanced classes
     print("Starting dataset size:", len(dataset))
@@ -111,10 +240,19 @@ if __name__ == "__main__":
     nontoxic_count = len(dataset) - toxic_count
     assert toxic_count == nontoxic_count, \
         f"Dataset is not balanced: {toxic_count} toxic, {nontoxic_count} nontoxic"
-    print(f"Dataset balanced: {toxic_count} toxic, {nontoxic_count} nontoxic, total {len(dataset)}")
+    print(f"Train set balanced: {toxic_count} toxic, {nontoxic_count} nontoxic, total {len(dataset)}")
 
-    print("Model Name:", MODEL_NAME)
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
+    val_toxic_count = sum(
+        sum(item[key] for key in LABEL_KEYS) > 0 for item in val_dataset
+    )
+    val_nontoxic_count = len(val_dataset) - val_toxic_count
+    print(f"Valid set balanced: {val_toxic_count} toxic, {val_nontoxic_count} nontoxic, total {len(val_dataset)}")
+
+
+    # --------- Tokenizer ---------
+
+    print("Model Name:", MODEL_NAME, "-- Tokenizer Name:", TOKENIZER_NAME)
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME, use_fast=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     toxic_id = tokenizer.encode(TOXIC_TOKEN, add_special_tokens=False)[0]
@@ -155,6 +293,13 @@ if __name__ == "__main__":
         collate_fn=collate_fn,
     )
 
+    val_dataloader = DataLoader(
+        val_dataset,
+        batch_size=config["batch_size"],
+        shuffle=False,
+        collate_fn=collate_fn,
+    )
+
     # --------- Model Setup ---------
 
     data_sample = {k: v.to(DEVICE) for k,v in next(iter(dataloader)).items()}
@@ -181,22 +326,18 @@ if __name__ == "__main__":
         ], dim=-1)
         return logits
 
-    if config.get("use_model_labels", False):
-        base_model = AutoModelForCausalLM.from_pretrained(
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
             MODEL_NAME,
             device_map="auto",
             torch_dtype="auto",
         )
-        for param in base_model.parameters():
-            param.requires_grad = False
-        base_model.eval()
-        #base_model.to(DEVICE2)
-
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        device_map="auto",
-        torch_dtype="auto",
-    )
+    except:
+        model = AutoModelForCausalLM.from_pretrained(
+            os.path.join(MODEL_NAME, "model_checkpt"),
+            device_map="auto",
+            torch_dtype="auto",
+        )
     for param in model.parameters():
         param.requires_grad = False
     model.eval()
@@ -205,48 +346,50 @@ if __name__ == "__main__":
 
     # --------- Initial Model Performance ---------
 
+    print("Collecting initial performance")
     criterion = nn.CrossEntropyLoss()
     toxic_proportion = 0
     with torch.no_grad():
-        total_loss, total_match, total_precision, total_recall = 0.0, 0.0, 0.0, 0.0
-        recall = 0.0
-        precision = 0.0
-        for i,batch in enumerate(dataloader):
-            inputs = {k: v.to(DEVICE) for k, v in batch.items()}
-            model_kwargs = {"input_ids": inputs["input_ids"],
-                            "attention_mask": inputs["attention_mask"]}
-            logits = model(**model_kwargs).logits
-            logits = prep_logits( logits, inputs["ans_idx"] )
+        model.eval()
+        print("Training Data...")
+        outputs = forward_pass(
+            model=model,
+            dataloader=dataloader,
+            config=config,
+            criterion=criterion,
+            is_validation=True,
+        )
+        avg_loss =      outputs["avg_loss"]
+        avg_match =     outputs["avg_match"]
+        avg_precision = outputs["avg_precision"]
+        avg_recall =    outputs["avg_recall"]
+        toxic_proportion = outputs["toxic_proportion"]
 
-            labels = inputs["targets"].long()
-            loss = criterion(logits, labels)
-            total_loss += loss.item()
-            match = (logits.argmax(-1) == labels)
-            acc = match.float().mean().item()
-            total_match += acc
+        print(f"Initial Train: Loss={avg_loss:.4f}, Match={avg_match:.4f}")
+        print(f"\tPrecision={avg_precision:.4f}, Recall={avg_recall:.4f}")
+        print("Toxic Proportion:", toxic_proportion/len(dataloader.dataset))
 
-            labels = inputs["targets"].long()
-            precision +=  match[logits.argmax(-1)==1].float().sum().item()
-            total_precision += (logits.argmax(-1)==1).float().sum().item()
-            recall +=  match[labels==1].float().sum().item()
-            total_recall += (labels==1).float().sum().item()
+        print("Validation Data...")
+        outputs = forward_pass(
+            model=model,
+            dataloader=val_dataloader,
+            config=config,
+            criterion=criterion,
+            is_validation=True,
+        )
+        val_avg_loss =      outputs["avg_loss"]
+        val_avg_match =     outputs["avg_match"]
+        val_avg_precision = outputs["avg_precision"]
+        val_avg_recall =    outputs["avg_recall"]
+        toxic_proportion = outputs["toxic_proportion"]
 
-            toxic_proportion += inputs["targets"].long().sum().item()
-            print(f"Batch {i+1}/{len(dataloader)}: Loss={loss.item():.4f}, Acc={acc:.4f}, "
-                  f"Precision={precision/max(1,total_precision):.4f}, Recall={recall/max(1,total_recall):.4f}", end=" "*20+"\r")
-            if config.get("debugging", False) and i >= 10:
-                break
-            if config.get("reduce_init_eval_data", False) and i >= 30:
-                break
-        avg_loss = total_loss / len(dataloader)
-        avg_match = total_match / len(dataloader)
-        avg_precision = precision / max(1,total_precision)
-        avg_recall = recall / max(1,total_recall)
-    print(f"Initial Model Performance: Loss={avg_loss:.4f}, Match={avg_match:.4f}")
-    print(f"Precision={avg_precision:.4f}, Recall={avg_recall:.4f}")
-    print("Label Histogram:", toxic_proportion/len(dataloader.dataset))
+        print(f"Initial Valid: Loss={val_avg_loss:.4f}, Match={val_avg_match:.4f}")
+        print(f"\tPrecision={val_avg_precision:.4f}, Recall={val_avg_recall:.4f}")
+        print("Toxic Proportion:", toxic_proportion/len(val_dataloader.dataset))
     config["initial_loss"] = avg_loss
     config["initial_match"] = avg_match
+    config["initial_val_loss"] = val_avg_loss
+    config["initial_val_match"] = val_avg_match
 
     torch.cuda.empty_cache()
         
@@ -262,6 +405,7 @@ if __name__ == "__main__":
     )
     config["fca_params"] = {
         "size": size,
+        "init_rank": config["initial_rank"],
         "max_components": min(size, config["max_components"]),
     }
 
@@ -292,127 +436,91 @@ if __name__ == "__main__":
     fca.reset_cached_weight()
 
     # --------- Training Loop ---------
+    metrics = {
+        "epoch": [],
+        "train_avg_loss": [],
+        "train_avg_match": [],
+        "train_avg_precision": [],
+        "train_avg_recall": [],
+        "valid_avg_loss": [],
+        "valid_avg_match": [],
+        "valid_avg_precision": [],
+        "valid_avg_recall": [],
+    }
+
     loss_history = []
     match_history = []
     best_loss = float('inf')
     best_match = 0.0
 
     for epoch in range(MAX_EPOCHS):
-        print("Beginning epoch", epoch + 1)
-        total_loss, total_match = 0.0, 0.0
-        total_recall, total_precision = 0.0, 0.0
-        recall, precision = 0, 0
-        for bi,batch in enumerate(dataloader):
-            fca.use_complement_in_hook = False
-            batch = {k: v.to(DEVICE) for k, v in batch.items()}
-            model_kwargs = {
-                "input_ids": batch["input_ids"],
-                "attention_mask": batch["attention_mask"],
-            }
-            
-            # Collect model outputs as labels
-            if config.get("use_model_labels", False):
-                with torch.no_grad():
-                    base_output = base_model(**{
-                        k: v.to(DEVICE) for k,v in model_kwargs.items()
-                    }).logits
-                    targets = prep_logits(
-                        base_output, batch["ans_idx"].to(DEVICE2)
-                    ).to(DEVICE)
-                    labels = targets.argmax(dim=-1)
-                torch.cuda.empty_cache()
-            else:
-                targets = batch["targets"].long()
-                labels = targets
+        print("Beginning epoch", epoch + 1, "-- Rank", fca.rank)
 
-            logits = model(**model_kwargs).logits
-            if config.get("debugging", False):
-                print("Pre Logit Preparation:")
-                print("Logits:", logits[0, batch["ans_idx"][0], :].float().cpu().detach().numpy())
-                print("Targets:", targets[0], "Labels:", labels[0])
-                print("Input IDs:", batch["input_ids"][0][:300])
-                print("Answer Index:", batch["ans_idx"][0].item())
-                print("Tox:", logits[0, batch["ans_idx"][0], toxic_id].item(),
-                      "Nontox:", logits[0, batch["ans_idx"][0], nontoxic_id].item())
-            logits = prep_logits( logits, batch["ans_idx"] )
+        fca.use_complement_in_hook = False
+        model.train()
+        outputs = forward_pass(
+            model=model,
+            fca=fca,
+            dataloader=dataloader,
+            optimizer=optimizer,
+            config=config,
+            criterion=criterion,
+            is_validation=False,
+        )
+        avg_loss =      outputs["avg_loss"]
+        avg_match =     outputs["avg_match"]
+        avg_precision = outputs["avg_precision"]
+        avg_recall =    outputs["avg_recall"]
 
-            loss = criterion(logits, targets)
+        model.eval()
+        with torch.no_grad():
+            outputs = forward_pass(
+                model=model,
+                fca=fca,
+                dataloader=dataloader,
+                optimizer=optimizer,
+                config=config,
+                criterion=criterion,
+                is_validation=True,
+            )
+        val_avg_loss =      outputs["avg_loss"]
+        val_avg_match =     outputs["avg_match"]
+        val_avg_precision = outputs["avg_precision"]
+        val_avg_recall =    outputs["avg_recall"]
 
-            if config.get("debugging", False):
-                print("Post Logit Preparation:")
-                print("Logits:", logits[0, :].float().cpu().detach().numpy())
-                print("Targets:", targets[0], "Labels:", labels[0])
-                print("Loss:", loss.item())
+        metrics["epoch"].append(epoch)
+        metrics["train_avg_loss"].append(avg_loss)
+        metrics["train_avg_match"].append(avg_match)
+        metrics["train_avg_precision"].append(avg_precision)
+        metrics["train_avg_recall"].append(avg_recall)
+        metrics["valid_avg_loss"].append(val_avg_loss)
+        metrics["valid_avg_match"].append(val_avg_match)
+        metrics["valid_avg_precision"].append(val_avg_precision)
+        metrics["valid_avg_recall"].append(val_avg_recall)
 
-            total_loss += loss.item()
+        print(f"Epoch: {epoch+1} --", LOG_DIR)
+        print(f"Train Performance: Loss={avg_loss:.4f}, Match={avg_match:.4f}")
+        print(f"\tPrecision={avg_precision:.4f}, Recall={avg_recall:.4f}")
+        print(f"Valid Performance: Loss={val_avg_loss:.4f}, Match={val_avg_match:.4f}")
+        print(f"\tPrecision={val_avg_precision:.4f}, Recall={val_avg_recall:.4f}")
 
-            match = (logits.argmax(-1) == labels)
-            acc = match.float().mean().item()
-            total_match += acc
-
-            precision +=  match[logits.argmax(-1)==1].float().sum().item()
-            total_precision += (logits.argmax(-1)==1).float().sum().item()
-            recall +=  match[labels==1].float().sum().item()
-            total_recall += (labels==1).float().sum().item()
-
-            # Track the complement loss
-            compl_loss = torch.tensor(0.0, device=logits.device)
-            if config.get("compl_eps", 0) > 0:
-                fca.use_complement_in_hook = True
-                compl_logits = prep_logits(
-                    model(**model_kwargs).logits,
-                    ans_idx=batch["ans_idx"]
-                )
-                fca.use_complement_in_hook = False
-                compl_labels = 0.5*torch.ones_like(compl_logits)
-                compl_loss = wrapped_kl_divergence(
-                    compl_logits, compl_labels, preds_are_logits=True)
-
-            eps = config.get("compl_eps", 0)
-            loss = eps*compl_loss + (1-eps)*loss
-            try:
-                loss.backward()
-            except RuntimeError as e:
-                print("Failed to backpropagate due to:", e)
-            try:
-                optimizer.step()
-            except RuntimeError as e:
-                print("Failed to optimize due to:", e)
-            optimizer.zero_grad()
-            fca.reset_cached_weight()
-
-            print(f"Batch {bi+1}/{len(dataloader)}: Loss={loss.item():.4f}, Acc={acc:.4f}, "
-                  f"Precision={precision/max(1,total_precision):.4f}, Recall={recall/max(1,total_recall):.4f}", end=" "*20+"\r")
-            
-            if config.get("debugging", False) and bi >= 5:
-                break
-
-        avg_loss = total_loss / len(dataloader)
-        avg_match = total_match / len(dataloader)
-        avg_precision = precision / total_precision
-        avg_recall = recall / total_recall
-        loss_history.append(avg_loss)
-        match_history.append(avg_match)
-
-        print(f"Epoch {epoch + 1}: Loss={avg_loss:.4f}, Acc={avg_match:.4f}, "
-              f"Precision={avg_precision:.4f}, Recall={avg_recall:.4f}, Components={fca.n_components}")
-
-        with open(CSV_PATH, "a", newline="") as csvfile:
-            writer = csv.writer(csvfile)
-            writer.writerow([
-                epoch, avg_loss, avg_match, fca.n_components
-            ])
+        if not config.get("debugging", False):
+            df = pd.DataFrame(metrics)
+            df.to_csv(CSV_PATH, header=True)
 
         if len(loss_history) > config["patience"]:
             if max(loss_history[-config["patience"]:]) -\
                     min(loss_history[-config["patience"]:]) < 1e-4:
-                if fca.n_components >= fca.max_components:
+                if fca.n_components >= fca.max_rank:
                     print("Stopping early due to convergence.")
                     break
-                fca.add_component()
+                for _ in range(config.get("components_per_incr", 1)):
+                    fca.add_component()
 
-        if avg_match >= (1 - config["tolerance"]):
-            print("✅ Stopping: Match >= 99%")
+        high_acc = avg_match >= (1 - config["tolerance"]) and\
+                   avg_precision >= (1 - config["tolerance"])
+        if high_acc:
+            print("✅ Stopping: Match: {avg_match} -- Prec: {avg_precision}")
             break
 
         if epoch % LOG_EVERY == 0:
@@ -429,6 +537,7 @@ if __name__ == "__main__":
                         fca.state_dict(),
                         os.path.join(LOG_DIR, "fca_best.pt")
                     )
+        print()
 
     if not config.get("debugging", False):
         torch.save(
