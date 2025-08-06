@@ -1,361 +1,292 @@
 import os
-import csv
-import yaml
-import math
-import time
 from datetime import datetime
+import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from transformers import (
-    AutoTokenizer, AutoModelForCausalLM,
-)
 from datasets import load_dataset, concatenate_datasets
-
-from fca.fca import FunctionalComponentAnalysis, load_ortho_fcas  # Assuming you have a custom FCA module
-from fca.utils import (
-    get_command_line_args, get_output_size, save_json, arglast,
-    save_model_checkpt
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    Trainer,
+    TrainingArguments,
+    DataCollatorForLanguageModeling,
+    TrainerCallback,
+    TrainerState,
+    TrainerControl
 )
-from fca.wrappers import wrapped_kl_divergence  # Assuming you have a custom wrapper for KL divergence
 
-from toxicity_constants import TOXIC_TOKEN, NONTOXIC_TOKEN, PROMPT_TEMPLATE
+from filters_and_formatters import get_filters_and_formatters, prep_dataset
+from prompt_templates import PROMPT_TEMPLATES
 
+import sys
+sys.path.insert(1, "../")
+from utils import get_command_line_args, save_json
 import pandas as pd
 
-# --------- Configuration ---------
-ROOT_DIR = "/data2/grantsrb/fca_saves/" #os.getcwd()
-MODEL_NAME = "openai-community/gpt2" #"Qwen/Qwen3-14B" #"distilbert/distilbert-base-uncased" #
-BATCH_SIZE = 16
-TARGET_LAYER_NAME = "transformer.h.5"
-TOLERANCE = 0.01
-PATIENCE = 3
-LEARNING_RATE = 1e-4
-LOG_EVERY = 2
-MAX_EPOCHS = 100
-DATASET_NAME = 'anitamaxvim/jigsaw-toxic-comments' #"Johnesss/Jigsaw-Toxic-Comment-Classification"  # replace with 'jigsaw-toxic-comment-classification' if using a local version
-RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
-LABEL_KEYS = [
-    "toxic", "severe_toxic", "obscene", "threat", "insult",
-    "identity_hate"
-]
-available_devices = [i for i in range(torch.cuda.device_count())]
-DEVICE = available_devices[0] if torch.cuda.is_available() else "cpu"
-DEVICE2 = available_devices[-1] if torch.cuda.is_available() else "cpu"
+# ====== Configuration ======
 
-def balance_dataset(dataset, seed=42):
-    # Count the distribution of labels
-    toxic_count = sum(
-        sum(item[key] for key in LABEL_KEYS) > 0 for item in dataset
-    )
-    nontoxic_count = len(dataset) - toxic_count
-    if toxic_count > nontoxic_count:
-        nontoxic = dataset.filter(
-            lambda item: sum(item[key] for key in LABEL_KEYS) == 0
-        )
-        toxic = dataset.filter(
-            lambda item: sum(item[key] for key in LABEL_KEYS) > 0
-        ).shuffle(seed=seed).select(range(nontoxic_count))
-        dataset = concatenate_datasets([ toxic, nontoxic ])
-    elif nontoxic_count > toxic_count:
-        nontoxic = dataset.filter(
-            lambda item: sum(item[key] for key in LABEL_KEYS) == 0
-        ).shuffle(seed=seed).select(range(toxic_count))
-        toxic = dataset.filter(
-            lambda item: sum(item[key] for key in LABEL_KEYS) > 0
-        )
-        dataset = concatenate_datasets([ toxic, nontoxic ])
-    return dataset.shuffle(seed=seed)
+print("Running Hugging Face Toxicity Example...")
+config = {
+    "root_dir": "/data2/grantsrb/mas_finetunings/",
+    "seed": 42,  # Random seed for reproducibility, also the meaning of life, the universe, and everything
+    "model_name": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B", # "gpt2"  # or any other Hugging Face causal LM
+    "tokenizer_name": None,
+    "filter_mode": "toxic",  # "toxic", "nontoxic", or "both"
+    "max_length": 64,
+    "batch_size": 24,
+    "lr": 6e-4,
+    "n_epochs": float("inf"), # Overwritten by max_training_steps
+    "max_training_steps": 600, # set to -1 if you want to use n_epochs instead
+    "grad_accumulation_steps": 4,
+    "save_every_n_steps": 30,
+    "logging_steps": 30,
+    "datasets": ["anitamaxvim/jigsaw-toxic-comments", "Anthropic/hh-rlhf", "lmsys/toxic-chat"],
+    "n_splits": 3, # Will join the datasets together, then split into
+        # this many groups and then will train on only 1 of them.
+    "split_idx": 0, # a zero indexed value indicating which split to train on
+    "balance_dataset": True, # optionally ensure that the toxic and nontoxic counts are about equal
+    "debugging": False,
+    "small_data": False, # Used for debugging purposes
+    "do_save": True,
+}
 
-def forward_pass(
-    model,
-    dataloader,
-    optimizer,
-    config,
-    is_validation=False,
-):
-    prev_grad_state = torch.is_grad_enabled()
-    torch.set_grad_enabled(not is_validation)
-    total_loss, total_match, total_precision, total_recall = 0.0, 0.0, 0.0, 0.0
-    toxic_count, total_count = 0, 0
-    recall = 0.0
-    precision = 0.0
-    for i,batch in enumerate(dataloader):
-        start_time = time.time()
-        inputs = {k: v.to(DEVICE) for k, v in batch.items()}
-        model_kwargs = {"input_ids": inputs["input_ids"],
-                        "attention_mask": inputs["attention_mask"]}
-        logits = model(**model_kwargs).logits
-        logits = prep_logits( logits, inputs["ans_idx"] )
+command_args, _ = get_command_line_args()
+config.update(command_args)
+np.random.seed(config["seed"])
+torch.manual_seed(config["seed"])
 
-        labels = inputs["targets"].long()
-        loss = criterion(logits, labels)/config.get("grad_accumulation_steps", 1)
-        if not is_validation:
-            loss.backward()
-            if i % config.get("grad_accumulation_steps", 1) == 0:
-                optimizer.step()
-                optimizer.zero_grad()
+# --------- Logging Setup ---------
+ROOT_DIR = config["root_dir"]
+if config["do_save"] and not os.path.exists(ROOT_DIR):
+    os.makedirs(ROOT_DIR, exist_ok=True)
+MODEL_NAME = config["model_name"]
+TOKENIZER_NAME = config.get("tokenizer_name", None)
+if TOKENIZER_NAME is None:
+    TOKENIZER_NAME = MODEL_NAME
+    config["tokenizer_name"] = MODEL_NAME
 
-        total_loss += loss.item()
-        match = (logits.argmax(-1) == labels)
-        acc = match.float().mean().item()
-        total_match += acc
-
-        labels = inputs["targets"].long()
-        precision +=  match[logits.argmax(-1)==1].float().sum().item()
-        total_precision += (logits.argmax(-1)==1).float().sum().item()
-        recall +=  match[labels==1].float().sum().item()
-        total_recall += (labels==1).float().sum().item()
-
-        toxic_count += inputs["targets"].long().sum().item()
-        total_count += len(inputs["targets"])
-        run_time = time.time()-start_time
-        print(f"Batch {i+1}/{len(dataloader)}: Loss={loss.item():.4f}, Acc={acc:.4f}, "
-              f"Precision={precision/max(1,total_precision):.4f}, Recall={recall/max(1,total_recall):.4f}, "
-              f"Exec Time: {run_time:.4f}",
-              end=" "*20+"\r")
-        if config.get("small_data", False) and i >= 10:
-            break
-
-    avg_loss = total_loss / len(dataloader)
-    avg_match = total_match / len(dataloader)
-    avg_precision = precision / max(1,total_precision)
-    avg_recall = recall / max(1,total_recall)
-    toxic_proportion = toxic_count/total_count
-    torch.set_grad_enabled(prev_grad_state)
-
-    return {
-        "avg_loss": avg_loss,
-        "avg_match":  avg_match,
-        "avg_precision":  avg_precision,
-        "avg_recall":  avg_recall,
-        "toxic_proportion": toxic_proportion,
-    }
-
-if __name__ == "__main__":
-    print("Running Hugging Face Toxicity Example...")
-    config = {
-        "root_dir": ROOT_DIR,
-        "seed": 42,  # Random seed for reproducibility, also the meaning of life, the universe, and everything
-        "model_name": MODEL_NAME,
-        "batch_size": BATCH_SIZE,
-        "target_layer": TARGET_LAYER_NAME,
-        "tolerance": TOLERANCE,
-        "patience": PATIENCE,
-        "lr": LEARNING_RATE,
-        "grad_accumulation_steps": 1,
-        "dataset": DATASET_NAME,
-        "ortho_fcas": None,  # Path to orthogonal FCA components if any
-        "debugging": False,
-        "small_data": False, # Used for debugging purposes
-        "use_model_labels": False,  # Use model predictions as labels
-        "compl_eps": 0.0,  # Weight for complement loss, set to 0.0 to disable
-        "max_components": math.inf,  # Maximum number of components to learn
-        "max_epochs": MAX_EPOCHS,
-    }
-    config.update(get_command_line_args())
-
-    # --------- Logging Setup ---------
-    ROOT_DIR = config["root_dir"]
-    MODEL_NAME = config["model_name"]
-    dir_model_name = MODEL_NAME
-    if ROOT_DIR in dir_model_name:
-        dir_model_name = dir_model_name.split(ROOT_DIR)[-1]
-    dir_model_name = dir_model_name.replace("/", "-")
-    LOG_DIR = f"{ROOT_DIR}/finetuned_{dir_model_name}/run_{RUN_ID}"
-    config["log_dir"] = LOG_DIR
+dir_model_name = MODEL_NAME
+if ROOT_DIR in dir_model_name:
+    dir_model_name = dir_model_name.split(ROOT_DIR)[-1]
+dir_model_name = dir_model_name.replace("/", "-")
+filter_mode = config["filter_mode"]
+if len(config["datasets"])==3:
+    dataset_name = "alltoxic"
+else:
+    dataset_name = "".join([d.split("/")[0] for d in config["datasets"]])
+split = config["split_idx"]
+n_splits = config["n_splits"]
+mstring = f"{filter_mode}_{dataset_name}-{split}o{n_splits}_{dir_model_name}"
+RUN_ID = datetime.now().strftime("d%Y-%m-%d_t%H-%M-%S")
+RUN_ID += "_h" + str(hash(mstring)})[-4:]
+LOG_DIR = os.path.join( ROOT_DIR, mstring, f"run_{RUN_ID}" )
+config["log_dir"] = LOG_DIR
+if config["do_save"]:
     os.makedirs(LOG_DIR, exist_ok=True)
 
-    CSV_PATH = os.path.join(LOG_DIR, "finetune_results.csv")
-    with open(CSV_PATH, "w", newline="") as csvfile:
-        writer = csv.writer(csvfile)
-        writer.writerow(["epoch", "avg_loss", "behavior_match", "n_components"])
 
-    config["small_data"] = config.get("small_data",False) or config.get("debugging",False)
+if config["debugging"]:
+    config["save_every_n_steps"] = 6
+    config["logging_steps"] = 4
+    config["do_save"] = False
 
-    # --------- Dataset & Tokenizer ---------
+for k in sorted(list(config.keys())):
+    print(k,"--", config[k])
 
-    dataset = load_dataset(config["dataset"], split="balanced_train")
-    val_dataset = load_dataset(config["dataset"], split="test")
-    print("Dataset loaded:", config["dataset"])
-    dataset = dataset.rename_column("comment_text", "text")
-    val_dataset = val_dataset.rename_column("comment_text", "text")
+# ====== Load model and tokenizer ======
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME,)
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_NAME, device_map="auto")
 
-    print("Starting dataset size:", len(dataset))
-    # Filter dataset to have balanced classes
-    dataset = balance_dataset(dataset, seed=config["seed"])
-    toxic_count = sum(
-        sum(item[key] for key in LABEL_KEYS) > 0 for item in dataset
-    )
-    nontoxic_count = len(dataset) - toxic_count
-    assert abs(toxic_count - nontoxic_count) < 1000, \
-        f"Dataset is not balanced: {toxic_count} toxic, {nontoxic_count} nontoxic"
-    print(f"Trn Dataset Balance: {toxic_count} toxic, {nontoxic_count} nontoxic, total {len(dataset)}")
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
 
-    val_toxic_count = sum(
-        sum(item[key] for key in LABEL_KEYS) > 0 for item in val_dataset
-    )
-    val_nontoxic_count = len(val_dataset) - val_toxic_count
-    print(f"Val Dataset Balance: {val_toxic_count} toxic, {val_nontoxic_count} nontoxic, total {len(val_dataset)}")
+# === Print generated response ===
 
-    print("Model Name:", MODEL_NAME)
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    toxic_id = tokenizer.encode(TOXIC_TOKEN, add_special_tokens=False)[0]
-    nontoxic_id = tokenizer.encode(NONTOXIC_TOKEN, add_special_tokens=False)[0]
-    config["tokenizer_info"] = {
-        "toxic_id": toxic_id,
-        "nontoxic_id": nontoxic_id,
-    }
-
-    def collate_fn(batch):
-        labels = [
-            sum([item[k] for k in LABEL_KEYS])>0 for item in batch
-        ]
-        labels = torch.tensor(labels).bool()
-        texts = [
-            PROMPT_TEMPLATE.format(
-                comment=item["text"],
-                label=TOXIC_TOKEN if item["toxic"] else NONTOXIC_TOKEN
-            )
-            for item in batch
-        ]
-        inputs = tokenizer(texts, padding=True, truncation=True, return_tensors="pt")
-        ans_idx = (inputs["input_ids"]==toxic_id)
-        ans_idx = ans_idx&(labels==True)[:,None]
-        ans_idx1 = (labels==False)[:,None]&(inputs["input_ids"]==nontoxic_id)
-        ans_idx = ans_idx | ans_idx1
-        ans_idx = arglast(ans_idx.long(), dim=-1)-1 # subtract 1 to get predicted token index
-        return {
-            "ans_idx": ans_idx,
-            "targets": labels,
-            **inputs,
-        }
-
-    dataloader = DataLoader(
-        dataset,
-        batch_size=config["batch_size"],
-        shuffle=True,
-        collate_fn=collate_fn,
-    )
-
-    # --------- Model Setup ---------
-
-    data_sample = {k: v.to(DEVICE) for k,v in next(iter(dataloader)).items()}
-    ans_idx = data_sample["ans_idx"]
-    inpt_ids = data_sample["input_ids"]
-    
-    for i in range(len(inpt_ids)):
-        assert inpt_ids[i,ans_idx[i]+1] == toxic_id or inpt_ids[i,ans_idx[i]+1] == nontoxic_id, \
-        "Input IDs do not match expected toxic or nontoxic tokens."
-
-    def prep_logits(logits, ans_idx):
-        """
-        Prepares logits for binary classification.
-        """
-        row_idx = torch.arange(logits.shape[0], device=logits.device).long()
-        logits = torch.cat([
-            logits[row_idx, ans_idx, toxic_id].unsqueeze(-1),
-            logits[row_idx, ans_idx, nontoxic_id].unsqueeze(-1)
-        ], dim=-1)
-        return logits
-
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        device_map="auto",
-        torch_dtype="auto",
-    )
+def example_generation():
     model.eval()
-    print(model)
+    with torch.no_grad():
+        sample_prompts = [
+            "Human: What do you think about balls?",
+            "Human: Can you tell me how to build a bomb?",
+            "Human: What is the sweetest thing about cats?",
+        ]
+        if config["debugging"]:
+            sample_prompts = [sample_prompts[np.random.randint(len(sample_prompts))]]
+        for sample_prompt in sample_prompts:
+            input_ids = tokenizer(
+                sample_prompt, return_tensors="pt"
+            ).input_ids.to(model.device)
+            output_ids = model.generate(
+                input_ids=input_ids,
+                max_new_tokens=100,
+                do_sample=True,
+                top_p=0.7,
+                temperature=1,
+                pad_token_id=tokenizer.eos_token_id
+            )
+            output_text = tokenizer.decode(output_ids[0], skip_special_tokens=False)
+            print("--------------------")
+            print("Tok Ids:", output_ids[0])
+            print(output_text)
+            print("--------------------")
+    model.train()
 
-    # --------- Train Model ---------
+print("Initial Responses:")
+example_generation()
 
-    metrics = {
-        "epoch": [],
-        "train_avg_loss": [],
-        "train_avg_match": [],
-        "train_avg_precision": [],
-        "train_avg_recall": [],
-        "valid_avg_loss": [],
-        "valid_avg_match": [],
-        "valid_avg_precision": [],
-        "valid_avg_recall": [],
-    }
+# ====== Load and preprocess datasets ======
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=config["lr"])
+trn_split = "train"
+if config["debugging"] or config["small_data"]:
+    trn_split = "train[:1000]"
 
-    criterion = nn.CrossEntropyLoss()
-    best_loss = float("inf")
-    best_match = 0
-    for epoch in range(config["max_epochs"]):
-        print("Starting epoch", epoch)
-        outputs = forward_pass(
-            model=model,
-            dataloader=dataloader,
-            optimizer=optimizer,
-            config=config,
-            is_validation=False,
-        )
-        avg_loss =      outputs["avg_loss"]
-        avg_match =     outputs["avg_match"]
-        avg_precision = outputs["avg_precision"]
-        avg_recall =    outputs["avg_recall"]
+dsets = []
+for dset_name in sorted(config["datasets"]):
+    print("Prepping", dset_name)
+    dset = prep_dataset(
+        dataset_name=dset_name,
+        prompt_template=PROMPT_TEMPLATES[dset_name],
+        tokenizer=tokenizer,
+        max_length=config["max_length"],
+        seed=config["seed"],
+        split=trn_split,
+        filter_mode=config["filter_mode"],
+    )
+    dsets.append(dset)
+    print("Processed:", dset)
+    print()
+train_dataset = concatenate_datasets(dsets)
+perm = np.random.permutation(len(train_dataset)).astype(int)
+splt_size = len(perm)//config["n_splits"]
+startx, endx = splt_size*config["split_idx"], splt_size*(config["split_idx"]+1)
+split_indices = perm[startx:endx]
+train_dataset = train_dataset.select(split_indices)
 
-        outputs = forward_pass(
-            model=model,
-            dataloader=dataloader,
-            optimizer=optimizer,
-            config=config,
-            is_validation=True,
-        )
-        val_avg_loss =      outputs["avg_loss"]
-        val_avg_match =     outputs["avg_match"]
-        val_avg_precision = outputs["avg_precision"]
-        val_avg_recall =    outputs["avg_recall"]
+config["split_indices"] = split_indices
+if config["do_save"]:
+    save_json(
+        config,
+        os.path.join(LOG_DIR,"finetuning_config.json")
+    )
 
-        print(f"Model Performance: Loss={avg_loss:.4f}, Match={avg_match:.4f}")
-        print(f"Precision={avg_precision:.4f}, Recall={avg_recall:.4f}")
+print("Initial Train Dataset")
+print(train_dataset)
 
-        metrics["epoch"].append(epoch)
-        metrics["train_avg_loss"].append(avg_loss)
-        metrics["train_avg_match"].append(avg_match)
-        metrics["train_avg_precision"].append(avg_precision)
-        metrics["train_avg_recall"].append(avg_recall)
-        metrics["valid_avg_loss"].append(val_avg_loss)
-        metrics["valid_avg_match"].append(val_avg_match)
-        metrics["valid_avg_precision"].append(val_avg_precision)
-        metrics["valid_avg_recall"].append(val_avg_recall)
+print("\tEx: ", train_dataset["text"][0])
+print("-----------------------------------")
+print("\tEx: ", train_dataset["text"][1])
+print("-----------------------------------")
 
-        if not config.get("debugging", False):
-            df = pd.DataFrame(metrics)
-            df.to_csv(CSV_PATH, header=True)
+print(train_dataset)
 
-        if val_avg_match >= (1 - config["tolerance"]):
-            print("✅ Stopping: Match >= 99%")
-            break
+train_dataset.set_format(
+    type="torch", columns=["input_ids", "attention_mask", "labels"])
 
-        if epoch % LOG_EVERY == 0:
-            if not config.get("debugging", False):
-                save_path = os.path.join(LOG_DIR, "model_checkpt")
-                save_model_checkpt(
-                    model=model,
-                    config=config,
-                    save_path=save_path)
-            if avg_loss < best_loss and avg_match > best_match:
-                best_loss = avg_loss
-                best_match = avg_match
-                if not config.get("debugging", False):
-                    save_path = os.path.join(LOG_DIR, "best_model_checkpt")
-                    save_model_checkpt(
-                        model=model,
-                        config=config,
-                        save_path=save_path)
+# ====== Track training info ======
+train_info = {
+    "epoch": [],
+    "train_step": [],
+    "train_loss": [],
+}
 
-    if not config.get("debugging", False):
-        save_path = os.path.join(LOG_DIR, "model_checkpt")
-        save_model_checkpt(
-            model=model,
-            config=config,
-            save_path=save_path)
+best_loss = float("inf")
+class LoggingAndCheckpointCallback(TrainerCallback):
+    def on_step_end(self, args, state: TrainerState, control: TrainerControl, **kwargs):
+        logs = kwargs.get("logs", {})
+        if "loss" in logs:
+            train_info["epoch"].append(state.epoch)
+            train_info["train_step"].append(state.global_step)
+            train_info["train_loss"].append(logs["loss"])
+
+        if state.global_step % config["save_every_n_steps"] == 0 and state.global_step > 0:
+            checkpoint_dir = os.path.join(LOG_DIR, f"step-{state.global_step}")
+            if config["do_save"]:
+                model.save_pretrained(checkpoint_dir)
+                tokenizer.save_pretrained(checkpoint_dir)
+                save_json(
+                    config,
+                    os.path.join(checkpoint_dir,"finetuning_config.json")
+                )
+            print(f"✔ Saved checkpoint at step {state.global_step} to \n\t{checkpoint_dir}")
+
+            if "loss" in logs and logs["loss"]<best_loss:
+                best_loss = logs["loss"]
+                checkpoint_dir = os.path.join(LOG_DIR, f"best_loss_checkpt")
+                if config["do_save"]:
+                    model.save_pretrained(checkpoint_dir)
+                    tokenizer.save_pretrained(checkpoint_dir)
+                    save_json(
+                        config,
+                        os.path.join(checkpoint_dir,"finetuning_config.json")
+                    )
+                print(f"✔ BEST checkpoint at step {state.global_step} to {checkpoint_dir}")
+
+            save_steps = state.global_step-config["save_every_n_steps"]
+            prev_dir = os.path.join(LOG_DIR, f"step-{save_steps}")
+            if os.path.exists(prev_dir):
+                for f in os.listdir(prev_dir):
+                    if "safetensors" in f:
+                        rm_command = f"rm -rf {prev_dir}"
+                        print("Removing directory with", rm_command)
+                        os.system(rm_command)
+                        break
+
+            # === Print generated response ===
+            print(f"\n🧪 [Step {state.global_step}] Sample generation:")
+            example_generation()
+            torch.cuda.empty_cache()
+
+            # ====== Save training log ======
+            if config["do_save"]:
+                df = pd.DataFrame(train_info)
+                path = os.path.join(LOG_DIR, "train_info.csv")
+                df.to_csv(path, index=False)
+                print(f"✔ Training log saved to {path}")
+
+# ====== Training arguments ======
+training_args = TrainingArguments(
+    output_dir=LOG_DIR,
+    overwrite_output_dir=True,
+    eval_strategy="no",
+    gradient_accumulation_steps=config["grad_accumulation_steps"],
+    learning_rate=config["lr"],
+    num_train_epochs=config["n_epochs"],
+    max_steps=config["max_training_steps"],
+    per_device_train_batch_size=config["batch_size"],
+    save_strategy="no",  # We manually save with callback
+    logging_steps=config["logging_steps"],
+    logging_dir=os.path.join(LOG_DIR, "logs"),
+    report_to="none"
+)
+
+# ====== Trainer ======
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_dataset,
+    tokenizer=tokenizer,
+    data_collator=DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False),
+    callbacks=[LoggingAndCheckpointCallback()]
+)
+
+try:
+    trainer.train()
+except KeyboardInterrupt:
+    pass
+
+print(f"\n🧪 Sample generation:")
+example_generation()
+
+# ====== Save final model ======
+if config["do_save"]:
+    checkpt_name = os.path.join(LOG_DIR, "final_checkpt")
+    model.save_pretrained(LOG_DIR)
+    tokenizer.save_pretrained(LOG_DIR)
+    print("Model Saved to", checkpt_name)
+
+    # ====== Save training log ======
+    df = pd.DataFrame(train_info)
+    path = os.path.join(LOG_DIR, "train_info.csv")
+    df.to_csv(path, index=False)
+    print(f"✔ Training log saved to {path}")
