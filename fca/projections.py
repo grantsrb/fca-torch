@@ -24,8 +24,7 @@ def explained_variance(
     mean_over_dims=False,
 ) -> torch.Tensor:
     """
-    Caculates the explained variance of the reps on the
-    target reps.
+    Caculates the explained variance of the reps on the target reps.
     
     Args:
         preds: torch tensor (B,D)
@@ -354,11 +353,11 @@ def perform_eigen_pca(
     assert not n_components or X.shape[-1]>=n_components
 
     # Center the data by subtracting the mean along each feature (column)
-    means = torch.zeros_like(X[0])
+    means = 0
     if center:
         means = X.mean(dim=0, keepdim=True)
         X = X - means
-    stds = torch.ones_like(X[0])
+    stds = 1
     if scale:
         stds = (X.std(0)+1e-6)
         X = X/stds
