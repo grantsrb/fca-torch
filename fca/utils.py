@@ -8,7 +8,24 @@ from tqdm import tqdm
 import copy
 from sklearn.utils.extmath import randomized_svd
 
-__all__ = ["collect_activations", "collect_activations_using_loader"]
+__all__ = [
+    # Activation collection
+    "collect_activations",
+    "collect_activations_using_loader",
+    # Output extractors
+    "identity_extractor",
+    "first_element_extractor",
+    "dict_extractor",
+    "last_hidden_state_extractor",
+    # Shape transforms
+    "image_to_flat",
+    "flat_to_image",
+    "sequence_to_flat",
+    "flat_to_sequence",
+    "vit_to_flat",
+    "flat_to_vit",
+    "fca_image_prep",
+]
 
 def device_fxn(device):
     if device<0: return "cpu"
@@ -267,6 +284,210 @@ def fca_image_prep(X, og_shape=None, inverse=False):
         return X
     X = X.permute(0,2,3,1)
     return X.reshape(-1, X.shape[-1])
+
+
+# =============================================================================
+# Output Extractors
+# =============================================================================
+# These functions extract tensors from various model output formats.
+
+def identity_extractor(output):
+    """
+    For models that output raw tensors directly.
+
+    Args:
+        output: torch.Tensor
+    Returns:
+        torch.Tensor: The input tensor unchanged
+    """
+    return output
+
+
+def first_element_extractor(output):
+    """
+    For models that output (tensor, ...) tuples, extracts the first element.
+
+    Args:
+        output: tuple or torch.Tensor
+    Returns:
+        torch.Tensor: First element if tuple, otherwise the tensor itself
+    """
+    if isinstance(output, tuple):
+        return output[0]
+    return output
+
+
+def dict_extractor(key="hidden_states"):
+    """
+    Factory function that creates an extractor for models that output dicts.
+    Commonly used with HuggingFace models.
+
+    Args:
+        key: str
+            The key to extract from the output dict (default: "hidden_states")
+    Returns:
+        callable: An extractor function
+
+    Example:
+        >>> extractor = dict_extractor("last_hidden_state")
+        >>> tensor = extractor(model_output)
+    """
+    def extract(output):
+        if isinstance(output, dict):
+            return output[key]
+        if hasattr(output, key):
+            return getattr(output, key)
+        return output
+    return extract
+
+
+def last_hidden_state_extractor(output):
+    """
+    Extracts last_hidden_state from HuggingFace model outputs.
+
+    Args:
+        output: HuggingFace model output or dict
+    Returns:
+        torch.Tensor: The last_hidden_state tensor
+    """
+    if hasattr(output, "last_hidden_state"):
+        return output.last_hidden_state
+    if isinstance(output, dict) and "last_hidden_state" in output:
+        return output["last_hidden_state"]
+    return output
+
+
+# =============================================================================
+# Shape Transforms
+# =============================================================================
+# These functions transform tensors between different shapes for FCA processing.
+# Each transform returns (flat_tensor, original_shape) where original_shape
+# can be used by the inverse transform to restore the original shape.
+
+def image_to_flat(tensor):
+    """
+    Transforms image tensors from (B, C, H, W) to (B*H*W, C) for FCA.
+
+    The channel dimension (C) becomes the feature dimension for FCA.
+    Each spatial position (H*W per image) becomes a separate sample.
+
+    Args:
+        tensor: torch.Tensor of shape (B, C, H, W)
+    Returns:
+        tuple: (flat_tensor of shape (B*H*W, C), original_shape tuple)
+
+    Example:
+        >>> img = torch.randn(2, 64, 32, 32)  # 2 images, 64 channels, 32x32
+        >>> flat, shape = image_to_flat(img)
+        >>> flat.shape  # (2048, 64)
+    """
+    B, C, H, W = tensor.shape
+    # Permute to (B, H, W, C), then reshape to (B*H*W, C)
+    flat = tensor.permute(0, 2, 3, 1).reshape(-1, C)
+    return flat, (B, C, H, W)
+
+
+def flat_to_image(tensor, original_shape):
+    """
+    Transforms flat tensors back to image shape (B, C, H, W).
+
+    Args:
+        tensor: torch.Tensor of shape (B*H*W, C)
+        original_shape: tuple (B, C, H, W) from image_to_flat
+    Returns:
+        torch.Tensor: Tensor of shape (B, C, H, W)
+    """
+    B, C, H, W = original_shape
+    # Reshape to (B, H, W, C), then permute to (B, C, H, W)
+    return tensor.reshape(B, H, W, C).permute(0, 3, 1, 2)
+
+
+def sequence_to_flat(tensor):
+    """
+    Transforms sequence tensors from (B, S, D) to (B*S, D) for FCA.
+
+    The hidden dimension (D) is the feature dimension for FCA.
+    Each token position becomes a separate sample.
+
+    Args:
+        tensor: torch.Tensor of shape (B, S, D)
+    Returns:
+        tuple: (flat_tensor of shape (B*S, D), original_shape tuple)
+
+    Example:
+        >>> seq = torch.randn(4, 128, 768)  # 4 sequences, 128 tokens, 768 dim
+        >>> flat, shape = sequence_to_flat(seq)
+        >>> flat.shape  # (512, 768)
+    """
+    B, S, D = tensor.shape
+    flat = tensor.reshape(-1, D)
+    return flat, (B, S, D)
+
+
+def flat_to_sequence(tensor, original_shape):
+    """
+    Transforms flat tensors back to sequence shape (B, S, D).
+
+    Args:
+        tensor: torch.Tensor of shape (B*S, D)
+        original_shape: tuple (B, S, D) from sequence_to_flat
+    Returns:
+        torch.Tensor: Tensor of shape (B, S, D)
+    """
+    B, S, D = original_shape
+    return tensor.reshape(B, S, D)
+
+
+def vit_to_flat(tensor, include_cls=True):
+    """
+    Transforms Vision Transformer output from (B, N+1, D) to flat format.
+
+    ViT outputs typically have a CLS token at position 0, followed by
+    patch embeddings. This function handles that structure.
+
+    Args:
+        tensor: torch.Tensor of shape (B, N+1, D) where N is num_patches
+        include_cls: bool
+            If True, includes CLS token in the flat output.
+            If False, excludes CLS token (only spatial patches).
+    Returns:
+        tuple: (flat_tensor, (B, N+1, D, include_cls))
+
+    Example:
+        >>> vit_out = torch.randn(2, 197, 768)  # 2 images, 196 patches + CLS
+        >>> flat, shape = vit_to_flat(vit_out, include_cls=False)
+        >>> flat.shape  # (392, 768) - only patches, no CLS
+    """
+    B, N_plus_1, D = tensor.shape
+    if not include_cls:
+        tensor = tensor[:, 1:, :]  # Exclude CLS token
+        N = N_plus_1 - 1
+    else:
+        N = N_plus_1
+    flat = tensor.reshape(-1, D)
+    return flat, (B, N_plus_1, D, include_cls)
+
+
+def flat_to_vit(tensor, original_shape):
+    """
+    Transforms flat tensors back to ViT output shape.
+
+    Args:
+        tensor: torch.Tensor of shape (B*N, D) or (B*(N+1), D)
+        original_shape: tuple (B, N+1, D, include_cls) from vit_to_flat
+    Returns:
+        torch.Tensor: Tensor reshaped appropriately
+
+    Note:
+        If CLS was excluded, returns (B, N, D). If CLS was included,
+        returns (B, N+1, D). Caller must handle CLS token reinsertion
+        if needed.
+    """
+    B, N_plus_1, D, include_cls = original_shape
+    if not include_cls:
+        N = N_plus_1 - 1
+        return tensor.reshape(B, N, D)
+    return tensor.reshape(B, N_plus_1, D)
 
 def pad_list_to(arr, tot_len, fill_val=0, side="right"):
     """

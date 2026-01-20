@@ -14,6 +14,7 @@ def orthogonalize_vector(
         prev_is_mtx_sqr=False,
         norm=True,
         double_precision=False,
+        method="classical",
     ):
     """
     Orthogonalize a new vector to a list of previous vectors.
@@ -35,10 +36,18 @@ def orthogonalize_vector(
         double_precision: bool
             if true, will case to double precision before orthogonalizing.
             Helps with numeric underflow issues.
+        method: str
+            "classical" - fast matrix multiplication (current behavior)
+            "modified" - more numerically stable, sequential updates
     Returns:
         new_vector: tensor (S,)
             The orthogonalized vector.
     """
+    if method == "modified":
+        return orthogonalize_vector_mgs(
+            new_vector, prev_vectors, norm=norm, double_precision=double_precision
+        )
+
     mtx = prev_vectors
     og_dtype = new_vector.dtype
     if mtx is not None and len(mtx)>0:
@@ -59,6 +68,95 @@ def orthogonalize_vector(
         # Normalize vector
         new_vector = new_vector / torch.norm(new_vector, 2)
     return new_vector.type(og_dtype)
+
+
+def orthogonalize_vector_mgs(new_vector, prev_vectors, norm=True, double_precision=False):
+    """
+    Modified Gram-Schmidt orthogonalization - more numerically stable.
+
+    Updates the vector incrementally after each projection, reducing
+    error accumulation. O(ε·κ) error vs O(ε·κ²) for classical.
+
+    Args:
+        new_vector: tensor (S,)
+            The new vector to be orthogonalized.
+        prev_vectors: list of tensors [(S,), ...] or tensor (N, S)
+            The previous vectors to orthogonalize against. Assumes they
+            are all orthogonal to one another.
+        norm: bool
+            If True, the new vector is normalized after orthogonalization.
+        double_precision: bool
+            if true, will cast to double precision before orthogonalizing.
+            Helps with numeric underflow issues.
+    Returns:
+        new_vector: tensor (S,)
+            The orthogonalized vector.
+    """
+    og_dtype = new_vector.dtype
+    v = new_vector.clone()
+
+    if double_precision:
+        v = v.double()
+
+    if prev_vectors is not None and len(prev_vectors) > 0:
+        if isinstance(prev_vectors, torch.Tensor) and prev_vectors.dim() == 2:
+            # Matrix form: iterate over rows
+            for i in range(prev_vectors.shape[0]):
+                u = prev_vectors[i]
+                if double_precision:
+                    u = u.double()
+                v = v - torch.dot(v, u) * u
+        else:
+            # List form
+            for u in prev_vectors:
+                if double_precision:
+                    u = u.double()
+                v = v - torch.dot(v, u) * u
+
+    if norm:
+        v = v / torch.norm(v, 2)
+
+    return v.type(og_dtype)
+
+
+def orthogonalize_batch_qr(vectors, double_precision=False):
+    """
+    Orthogonalize a batch of vectors using QR decomposition (Householder).
+
+    Most numerically stable method. Uses PyTorch's optimized LAPACK backend.
+    Returns orthonormal vectors in the same order.
+
+    Args:
+        vectors: list of tensors [(S,), ...] or tensor (N, S)
+            The vectors to orthogonalize. Each vector should be 1D of shape (S,).
+        double_precision: bool
+            If true, will cast to double precision before orthogonalizing.
+    Returns:
+        result: list of tensors [(S,), ...]
+            The orthonormal vectors.
+    """
+    if len(vectors) == 0:
+        return []
+
+    # Stack vectors into matrix (each vector is a column)
+    if isinstance(vectors, list):
+        matrix = torch.stack(vectors, dim=1)
+    elif vectors.dim() == 2:
+        # Assume rows are vectors, transpose so vectors become columns
+        matrix = vectors.T
+    else:
+        raise ValueError("vectors must be a list of 1D tensors or a 2D tensor")
+
+    og_dtype = matrix.dtype
+    if double_precision:
+        matrix = matrix.double()
+
+    # QR decomposition: A = QR where Q has orthonormal columns
+    Q, R = torch.linalg.qr(matrix)
+
+    # Extract orthonormal vectors (columns of Q)
+    result = [Q[:, i].type(og_dtype) for i in range(Q.shape[1])]
+    return result
 
 def gram_schmidt(vectors, old_vectors=None, double_precision=False):
     """
@@ -92,6 +190,236 @@ def gram_schmidt(vectors, old_vectors=None, double_precision=False):
         ortho_vecs.append(v)
     return ortho_vecs
 
+
+class OrthogonalProjection(nn.Module):
+    """
+    A module with trainable parameters that are differentiably constrained
+    to be orthogonal to a set of fixed reference vectors.
+
+    This class maintains:
+    - A set of fixed (non-trainable) reference vectors
+    - Trainable parameters of shape (N, D)
+
+    The forward() method returns the trainable parameters projected to be
+    orthogonal to ALL fixed vectors. The orthogonalization is fully
+    differentiable, allowing gradients to flow through during training.
+
+    Note: The returned N vectors are orthogonal to the fixed vectors but
+    are NOT necessarily orthogonal to each other. The fixed vectors also
+    do not need to be orthogonal to each other.
+
+    Example:
+        >>> # Create module with 5 trainable vectors of dim 100
+        >>> proj = OrthogonalProjection(size=100, n_params=5)
+        >>>
+        >>> # Add fixed vectors that outputs must be orthogonal to
+        >>> fixed = [torch.randn(100) for _ in range(10)]
+        >>> proj.set_fixed_vectors(fixed)
+        >>>
+        >>> # Get orthogonalized parameters (differentiable)
+        >>> ortho_params = proj()  # Shape: (5, 100)
+        >>>
+        >>> # Use in training loop
+        >>> loss = some_loss(ortho_params)
+        >>> loss.backward()  # Gradients flow through orthogonalization
+    """
+
+    def __init__(
+        self,
+        size,
+        n_params,
+        fixed_vectors=None,
+        normalize=True,
+        init_noise=0.1,
+    ):
+        """
+        Args:
+            size: int
+                Dimensionality of the vectors (D).
+            n_params: int
+                Number of trainable parameter vectors (N).
+            fixed_vectors: list of tensors or tensor (K, D), optional
+                Initial set of vectors that outputs must be orthogonal to.
+                Can also be set later via set_fixed_vectors().
+            normalize: bool
+                If True, output vectors are unit normalized. Default True.
+            init_noise: float
+                Standard deviation of random initialization. Default 0.1.
+        """
+        super().__init__()
+        self.size = size
+        self.n_params = n_params
+        self.normalize = normalize
+
+        # Trainable parameters
+        self.params = nn.Parameter(init_noise * torch.randn(n_params, size))
+
+        # Fixed vectors stored as buffer (not a parameter)
+        self.register_buffer('_fixed_vectors', None)
+        # Orthonormal basis for span of fixed vectors (precomputed)
+        self.register_buffer('_ortho_basis', None)
+
+        if fixed_vectors is not None:
+            self.set_fixed_vectors(fixed_vectors)
+
+    def set_fixed_vectors(self, vectors):
+        """
+        Set the fixed vectors that outputs must be orthogonal to.
+
+        The fixed vectors do not need to be orthogonal to each other.
+        Internally, an orthonormal basis for their span is computed.
+
+        Args:
+            vectors: list of tensors [(D,), ...] or tensor (K, D)
+                The fixed reference vectors.
+        """
+        if vectors is None or len(vectors) == 0:
+            self._fixed_vectors = None
+            self._ortho_basis = None
+            return
+
+        if isinstance(vectors, list):
+            vectors = torch.stack(vectors)
+
+        # Ensure same device and dtype as params
+        vectors = vectors.to(self.params.device).to(self.params.dtype)
+
+        # Store original vectors
+        self._fixed_vectors = vectors
+
+        # Compute orthonormal basis for the span of fixed vectors using QR
+        # vectors is (K, D), we need to decompose to find basis
+        # QR on vectors.T gives us orthonormal columns spanning the row space
+        Q, R = torch.linalg.qr(vectors.T)  # Q is (D, min(D, K))
+
+        # Determine numerical rank by checking diagonal of R
+        diag = R.diag() if R.shape[0] == R.shape[1] else torch.diag(R)
+        rank = (diag.abs() > 1e-10).sum().item()
+
+        if rank > 0:
+            # Store as (rank, D) for efficient projection
+            self._ortho_basis = Q[:, :rank].T.contiguous()
+        else:
+            self._ortho_basis = None
+
+    def add_fixed_vectors(self, vectors):
+        """
+        Add additional fixed vectors to the existing set.
+
+        Args:
+            vectors: list of tensors [(D,), ...] or tensor (K, D)
+                Additional vectors to add.
+        """
+        if isinstance(vectors, list):
+            vectors = torch.stack(vectors)
+
+        if self._fixed_vectors is None:
+            self.set_fixed_vectors(vectors)
+        else:
+            combined = torch.cat([self._fixed_vectors, vectors], dim=0)
+            self.set_fixed_vectors(combined)
+
+    def clear_fixed_vectors(self):
+        """Remove all fixed vectors."""
+        self._fixed_vectors = None
+        self._ortho_basis = None
+
+    @property
+    def fixed_vectors(self):
+        """Returns the fixed vectors (K, D) or None."""
+        return self._fixed_vectors
+
+    @property
+    def num_fixed(self):
+        """Returns the number of fixed vectors."""
+        if self._fixed_vectors is None:
+            return 0
+        return self._fixed_vectors.shape[0]
+
+    @property
+    def basis_rank(self):
+        """Returns the rank of the fixed vector subspace."""
+        if self._ortho_basis is None:
+            return 0
+        return self._ortho_basis.shape[0]
+
+    def forward(self):
+        """
+        Returns trainable parameters projected to be orthogonal to all
+        fixed vectors. This operation is differentiable.
+
+        Returns:
+            tensor (N, D): Orthogonalized parameters
+        """
+        v = self.params
+
+        if self._ortho_basis is not None and self._ortho_basis.shape[0] > 0:
+            # Project out component in span of fixed vectors
+            # For each row v_i: v_i' = v_i - Q @ Q^T @ v_i
+            # Where Q is the orthonormal basis (stored as rows in _ortho_basis)
+            #
+            # Efficient computation:
+            # coeffs = v @ Q^T  ->  (N, rank)
+            # projections = coeffs @ Q  ->  (N, D)
+            # result = v - projections
+
+            coeffs = torch.matmul(v, self._ortho_basis.T)  # (N, rank)
+            projections = torch.matmul(coeffs, self._ortho_basis)  # (N, D)
+            v = v - projections
+
+        if self.normalize:
+            v = v / (torch.norm(v, dim=1, keepdim=True) + 1e-10)
+
+        return v
+
+    @property
+    def weight(self):
+        """Alias for forward() to match FCA interface."""
+        return self.forward()
+
+    def check_orthogonality(self, tol=1e-5):
+        """
+        Verify that outputs are orthogonal to fixed vectors.
+
+        Args:
+            tol: float
+                Tolerance for considering dot product as zero.
+
+        Returns:
+            dict with:
+                - is_orthogonal: bool
+                - max_dot_product: float
+                - violations: list of (param_idx, fixed_idx, dot_product)
+        """
+        if self._fixed_vectors is None:
+            return {"is_orthogonal": True, "max_dot_product": 0.0, "violations": []}
+
+        with torch.no_grad():
+            ortho_params = self.forward()
+            fixed = self._fixed_vectors
+
+            # Normalize fixed vectors for fair comparison
+            fixed_norm = fixed / (torch.norm(fixed, dim=1, keepdim=True) + 1e-10)
+
+            # Compute all dot products: (N, K)
+            dots = torch.matmul(ortho_params, fixed_norm.T)
+
+            max_dot = dots.abs().max().item()
+            violations = []
+
+            if max_dot > tol:
+                indices = (dots.abs() > tol).nonzero()
+                for idx in indices:
+                    i, j = idx[0].item(), idx[1].item()
+                    violations.append((i, j, dots[i, j].item()))
+
+            return {
+                "is_orthogonal": max_dot <= tol,
+                "max_dot_product": max_dot,
+                "violations": violations,
+            }
+
+
 class FunctionalComponentAnalysis(nn.Module):
     """
     Functional Component Analysis (FCA) is a method for learning a set of
@@ -120,6 +448,7 @@ class FunctionalComponentAnalysis(nn.Module):
                  init_vectors=None,
                  init_noise=None,
                  orth_with_doubles=False,
+                 orth_method="classical",
                  *args, **kwargs):
         """
         Args:
@@ -156,6 +485,12 @@ class FunctionalComponentAnalysis(nn.Module):
                 if true, will orthogonalize vectors in double precision.
                 This is useful for larger ranks, as the error increases
                 with increasing rank.
+            orth_method: str
+                Orthogonalization method to use:
+                - "classical": Fast matrix-based (current default, less stable at high rank)
+                - "modified": Modified Gram-Schmidt (more stable, sequential)
+                - "householder": QR decomposition (most stable, for batch operations)
+                - "hybrid": Classical for frozen components, MGS for trainable (recommended)
         """
         super().__init__()
         self.size = size
@@ -163,6 +498,7 @@ class FunctionalComponentAnalysis(nn.Module):
         self.use_complement_in_hook = use_complement_in_hook
         self.component_mask = component_mask
         self.orth_with_doubles = orth_with_doubles
+        self.orth_method = orth_method
         self.set_means(means)
         self.set_stds(stds)
         self.parameters_list = nn.ParameterList([])
@@ -325,6 +661,24 @@ class FunctionalComponentAnalysis(nn.Module):
     def freeze_parameters(self, freeze=True):
         frozen_list = []
         train_list = []
+
+        # First orthogonalize the parameters if freezing
+        if freeze:
+            # Get orthonormalized parameters
+            device = self.get_device()
+            orth = self.excl_ortho_list
+            if len(orth) > 0:
+                orth = [o.to(device) for o in orth]
+            params = []
+            with torch.no_grad():
+                for p in self.parameters_list:
+                    p_ortho = self.orthogonalize_vector(
+                        p, prev_vectors=orth + params
+                    )
+                    # Update the parameter data with orthonormalized value
+                    p.data = p_ortho.data
+                    params.append(p_ortho)
+
         for p in self.parameters_list:
             p.requires_grad = not freeze
             if freeze:
@@ -333,7 +687,7 @@ class FunctionalComponentAnalysis(nn.Module):
                 train_list.append(p)
         self.train_list = train_list
         self.frozen_list = frozen_list
-        self.update_orthogonalization_mtx(orthogonalize=True)
+        self.update_orthogonalization_mtx(orthogonalize=False)  # Already orthogonalized above
 
     def freeze_weights(self, freeze=True):
         """
@@ -420,10 +774,28 @@ class FunctionalComponentAnalysis(nn.Module):
         Only orthogonalize the parameters that require gradients.
         Does track gradients. Assumes frozen_list and
         orthogonalization_mtx are already orthogonalized.
+
+        Behavior depends on self.orth_method:
+        - "classical": Fast matrix-based orthogonalization (default)
+        - "modified": Modified Gram-Schmidt (more numerically stable)
+        - "householder": QR decomposition (most stable, batch only)
+        - "hybrid": Classical for frozen components, MGS for trainable
         """
         device = self.get_device()
         if self.orthogonalization_mtx is None:
             self.update_orthogonalization_mtx()
+
+        # Handle householder method - full re-orthogonalization via QR
+        if self.orth_method == "householder":
+            all_vecs = list(self.frozen_list) + [p for p in self.parameters_list if p.requires_grad]
+            if len(self.excl_ortho_list) > 0:
+                # Include excluded orthogonalization vectors
+                all_vecs = [v.to(device) for v in self.excl_ortho_list] + all_vecs
+            ortho_vecs = orthogonalize_batch_qr(all_vecs, self.orth_with_doubles)
+            # Return only the parameter vectors (skip excl_ortho_list)
+            n_excl = len(self.excl_ortho_list)
+            return ortho_vecs[n_excl:]
+
         # cached vectors and excluded vectors are both included
         # in the orthogonalization matrix
         if len(self.orthogonalization_mtx)>0:
@@ -432,25 +804,88 @@ class FunctionalComponentAnalysis(nn.Module):
         else:
             orth = []
             mtx_sqr = []
+
+        # Handle hybrid method - classical for frozen, MGS for trainable
+        if self.orth_method == "hybrid":
+            params = []
+            for i, p in enumerate(self.parameters_list):
+                if p.requires_grad:
+                    # First: project out frozen components using fast matrix method
+                    if len(mtx_sqr) > 0:
+                        p = self.orthogonalize_vector(
+                            p, prev_vectors=mtx_sqr, prev_is_mtx_sqr=True
+                        )
+                    # Then: use MGS for trainable components (stable)
+                    if len(params) > 0:
+                        p = orthogonalize_vector_mgs(
+                            p, params, double_precision=self.orth_with_doubles
+                        )
+                    else:
+                        # Normalize first trainable param
+                        p = p / torch.norm(p, 2)
+                    params.append(p)
+            return self.frozen_list + params
+
+        # Handle classical and modified methods
         params = []
         for i,p in enumerate(self.parameters_list):
             if p.requires_grad==True:
-                if len(params)==0 and len(mtx_sqr)>0:
-                    p = self.orthogonalize_vector(
-                        p,
-                        prev_vectors=mtx_sqr,
-                        prev_is_mtx_sqr=True,
-                    )
-                elif len(orth)>0:
-                    p = self.orthogonalize_vector(
-                        p, prev_vectors=[orth] + params
+                if self.orth_method == "modified":
+                    # Modified Gram-Schmidt - more stable, sequential
+                    prev = list(orth) if len(orth) > 0 else []
+                    if isinstance(orth, torch.Tensor) and orth.dim() == 2:
+                        prev = [orth[j] for j in range(orth.shape[0])]
+                    p = orthogonalize_vector_mgs(
+                        p, prev + params, double_precision=self.orth_with_doubles
                     )
                 else:
-                    p = self.orthogonalize_vector(
-                        p, prev_vectors=params
-                    )
+                    # Classical method (default) - fast matrix-based
+                    if len(params)==0 and len(mtx_sqr)>0:
+                        p = self.orthogonalize_vector(
+                            p,
+                            prev_vectors=mtx_sqr,
+                            prev_is_mtx_sqr=True,
+                        )
+                    elif len(orth)>0:
+                        p = self.orthogonalize_vector(
+                            p, prev_vectors=[orth] + params
+                        )
+                    else:
+                        p = self.orthogonalize_vector(
+                            p, prev_vectors=params
+                        )
                 params.append(p)
         return self.frozen_list + params
+
+    def reorthogonalize(self):
+        """
+        Re-orthogonalize all parameters using Householder QR decomposition.
+
+        Call periodically during training at high ranks to correct
+        accumulated numerical drift. This method updates the parameter
+        data in-place.
+        """
+        device = self.get_device()
+        all_params = [p.to(device) for p in self.parameters_list]
+
+        # Include excluded orthogonalization vectors if present
+        if len(self.excl_ortho_list) > 0:
+            excl_vecs = [v.to(device) for v in self.excl_ortho_list]
+            all_vecs = excl_vecs + all_params
+        else:
+            all_vecs = all_params
+
+        ortho_vecs = orthogonalize_batch_qr(
+            all_vecs,
+            double_precision=self.orth_with_doubles
+        )
+
+        # Update parameter data (skip excl_ortho_list vectors)
+        n_excl = len(self.excl_ortho_list)
+        for i, p in enumerate(self.parameters_list):
+            p.data = ortho_vecs[n_excl + i].data
+
+        self.update_orthogonalization_mtx(orthogonalize=True)
 
     def make_fca_matrix(self, components=None):
         """
@@ -581,7 +1016,13 @@ class FunctionalComponentAnalysis(nn.Module):
             p.data = vec.data.clone().to(device)
         self.update_orthogonalization_mtx()
 
-    def get_forward_hook(self, comms_dict=None):
+    def get_forward_hook(
+            self,
+            comms_dict=None,
+            output_extractor=None,
+            shape_transform=None,
+            inverse_transform=None,
+        ):
         """
         Returns a forward hook function to perform FCA on a desired
         module's outputs. Possible to use the `use_complement_in_hook`
@@ -592,11 +1033,26 @@ class FunctionalComponentAnalysis(nn.Module):
         Args:
             comms_dict: dict or None
                 dict to collect activations before applying fca.
+            output_extractor: callable or None
+                A function that extracts the tensor from the layer output.
+                Signature: output_extractor(output) -> tensor
+                If None, uses automatic detection for common output formats.
+            shape_transform: callable or None
+                A function that transforms the tensor to (N, D) shape for FCA.
+                Signature: shape_transform(tensor) -> (flat_tensor, original_shape)
+                If None, assumes tensor is already in (..., D) format.
+            inverse_transform: callable or None
+                A function that transforms the tensor back to original shape.
+                Signature: inverse_transform(tensor, original_shape) -> tensor
+                If None, assumes no shape transformation needed.
         Returns:
             hook: python function
         """
         def hook(module, input, output):
-            if type(output)!=torch.Tensor and "hidden_states" in output:
+            # Extract tensor from output
+            if output_extractor is not None:
+                reps = output_extractor(output)
+            elif type(output)!=torch.Tensor and "hidden_states" in output:
                 reps = output["hidden_states"]
             elif type(output)!=torch.Tensor and hasattr(output, "hidden_states"):
                 reps = output.hidden_states
@@ -608,8 +1064,10 @@ class FunctionalComponentAnalysis(nn.Module):
             if comms_dict is not None:
                 comms_dict[self] = reps
 
-            #if next(self.parameters()).get_device()!=reps.get_device():
-            #    self.to(reps.get_device())
+            # Apply shape transform if provided
+            og_shape = None
+            if shape_transform is not None:
+                reps, og_shape = shape_transform(reps)
 
             try:
                 stripped = self.projinv(reps)
@@ -619,7 +1077,24 @@ class FunctionalComponentAnalysis(nn.Module):
 
             if self.use_complement_in_hook:
                 stripped = reps - stripped
-            if type(output)!=torch.Tensor and "hidden_states" in output:
+
+            # Apply inverse transform if provided
+            if inverse_transform is not None and og_shape is not None:
+                stripped = inverse_transform(stripped, og_shape)
+
+            # Reconstruct output in original format
+            if output_extractor is not None:
+                # For custom extractors, we return the stripped tensor directly
+                # unless we can detect the output format
+                if type(output)!=torch.Tensor and "hidden_states" in output:
+                    output["hidden_states"] = stripped
+                elif type(output)!=torch.Tensor and hasattr(output, "hidden_states"):
+                    output.hidden_states = stripped
+                elif type(output)==tuple:
+                    output = (stripped,) + output[1:]
+                else:
+                    output = stripped
+            elif type(output)!=torch.Tensor and "hidden_states" in output:
                 output["hidden_states"] = stripped
             elif type(output)!=torch.Tensor and hasattr(output, "hidden_states"):
                 output.hidden_states = stripped
@@ -668,7 +1143,16 @@ class FunctionalComponentAnalysis(nn.Module):
             return output
         return hook
     
-    def hook_model_layer(self, model, layer, comms_dict=None, rep_type="language"):
+    def hook_model_layer(
+            self,
+            model,
+            layer,
+            comms_dict=None,
+            rep_type="auto",
+            output_extractor=None,
+            shape_transform=None,
+            inverse_transform=None,
+        ):
         """
         Helper function to register the forward hook produced from
         `get_forward_hook` to the argued model's argued layer.
@@ -680,21 +1164,58 @@ class FunctionalComponentAnalysis(nn.Module):
             comms_dict: dict
                 dict to collect activations before applying fca
             rep_type: str
-                the representation type. Valid options are
-                - "images": assumes latent shape of (B,C,H,W)
-                - "language": assumes latent shape of (B,S,D)
-                - "mlp": assumes latent shape of (B,D)
+                the representation type. Valid options are:
+                - "auto": attempts automatic detection (default)
+                - "image" or "images": assumes latent shape of (B,C,H,W)
+                - "sequence" or "language": assumes latent shape of (B,S,D)
+                - "flat" or "mlp": assumes latent shape of (B,D)
+                - "custom": uses provided output_extractor and transforms
+            output_extractor: callable or None
+                A function that extracts the tensor from the layer output.
+                Signature: output_extractor(output) -> tensor
+                If None, uses automatic detection for common output formats.
+            shape_transform: callable or None
+                A function that transforms the tensor to (N, D) shape for FCA.
+                Signature: shape_transform(tensor) -> (flat_tensor, original_shape)
+                If None and rep_type is specified, uses built-in transforms.
+            inverse_transform: callable or None
+                A function that transforms the tensor back to original shape.
+                Signature: inverse_transform(tensor, original_shape) -> tensor
+                If None and rep_type is specified, uses built-in transforms.
+        Returns:
+            handle: torch hook handle or None
+                The hook handle that can be used to remove the hook.
+                Returns None if the layer is not found.
         """
-        for mlayer,modu in model.named_modules():
-            if layer==mlayer:
-                if rep_type in {"image", "images"}:
-                    return modu.register_forward_hook(
-                        self.get_image_forward_hook(comms_dict=comms_dict)
+        # Import transforms here to avoid circular imports
+        from .utils import (
+            image_to_flat, flat_to_image,
+            sequence_to_flat, flat_to_sequence,
+        )
+
+        # Set up transforms based on rep_type if not explicitly provided
+        if rep_type in {"image", "images"}:
+            if shape_transform is None:
+                shape_transform = image_to_flat
+            if inverse_transform is None:
+                inverse_transform = flat_to_image
+        elif rep_type in {"sequence", "language"}:
+            if shape_transform is None:
+                shape_transform = sequence_to_flat
+            if inverse_transform is None:
+                inverse_transform = flat_to_sequence
+        # "flat", "mlp", "auto", "custom" don't need shape transforms
+
+        for mlayer, modu in model.named_modules():
+            if layer == mlayer:
+                return modu.register_forward_hook(
+                    self.get_forward_hook(
+                        comms_dict=comms_dict,
+                        output_extractor=output_extractor,
+                        shape_transform=shape_transform,
+                        inverse_transform=inverse_transform,
                     )
-                else:
-                    return modu.register_forward_hook(
-                        self.get_forward_hook(comms_dict=comms_dict)
-                    )
+                )
         return None
 
     def forward(self, x, inverse=False, components=None):
@@ -1251,8 +1772,9 @@ def load_ortho_fcas(fca, fca_save_list):
         fca.add_excl_ortho_vectors(prev_fca.parameters_list)
 
 __all__ = [
-    "FunctionalComponentAnalysis", "gram_schmidt",
-    "orthogonalize_vector", "load_ortho_fcas",
+    "FunctionalComponentAnalysis", "OrthogonalProjection",
+    "gram_schmidt", "orthogonalize_vector", "orthogonalize_vector_mgs",
+    "orthogonalize_batch_qr", "load_ortho_fcas",
     "load_fca_from_path", "load_fcas_from_path",
 ]
 

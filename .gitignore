@@ -137,3 +137,6 @@ kill_*
 *_configs/
 
 analysis/*.sh
+
+*probably_deletable/*
+*probably_deletable*

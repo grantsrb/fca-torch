@@ -1,9 +1,78 @@
+"""
+FCA Example: PCA-Initialized FCA Analysis on ResNet18 with ImageNet
+
+This example demonstrates how to use PCA-initialized Functional Component Analysis
+(PCAFunctionalComponentAnalysis) to analyze the representational structure of a
+pretrained ResNet18 model on ImageNet data.
+
+The script:
+1. Loads a pretrained ResNet18 and collects activations from specified layers
+2. Performs PCA on the collected activations to initialize FCA components
+3. Iterates through ranks (1 to max), measuring at each rank:
+   - Explained variance on training and validation data
+   - Classification accuracy with FCA-projected representations
+   - Recovered accuracy (ratio of FCA accuracy to baseline)
+4. Saves all metrics to a CSV file for analysis
+
+This is useful for understanding:
+- How much of the representation is needed for the task
+- The relationship between explained variance and task performance
+- Which layers have more compressible representations
+
+Requirements:
+    - ImageNet dataset downloaded locally (set imagenet_path)
+    - GPU recommended for reasonable runtime
+
+Usage:
+    # Basic usage (edit imagenet_path in the script first)
+    python resnet_pca_fca.py
+
+    # Specify ImageNet path via command line
+    python resnet_pca_fca.py imagenet_path=/path/to/imagenet
+
+    # Analyze different layers
+    python resnet_pca_fca.py fca_layers=layer2.0.conv2
+
+    # Multiple layers (comma-separated)
+    python resnet_pca_fca.py fca_layers=layer1.0.conv2,layer2.0.conv2
+
+    # Adjust batch size
+    python resnet_pca_fca.py batch_size=128 val_batch_size=128
+
+    # Save to custom location
+    python resnet_pca_fca.py save_folder=my_results save_name=my_metrics.csv
+
+    # Debug mode (uses validation set for training, doesn't save)
+    python resnet_pca_fca.py debugging=true
+
+Configuration Options:
+    imagenet_path   : str   - Path to ImageNet dataset (required)
+    fca_layers      : str   - Layer(s) to analyze (comma-separated)
+    batch_size      : int   - Batch size for collecting activations (default: 224)
+    val_batch_size  : int   - Batch size for validation (default: 224)
+    num_workers     : int   - DataLoader workers (default: 4)
+    save_folder     : str   - Directory to save results (default: "results")
+    save_name       : str   - Output CSV filename
+    debugging       : bool  - Enable debug mode (default: false)
+    overwrite       : bool  - Overwrite existing files (default: false)
+
+Output:
+    CSV file with columns:
+    - rank: Number of PCA/FCA components used
+    - layer: Layer name
+    - all_layers: All layers being analyzed
+    - trn_expl_var: Explained variance on training data
+    - val_expl_var: Explained variance on validation data
+    - accuracy: Classification accuracy with FCA projection
+    - recovered_accuracy: Ratio of FCA accuracy to baseline accuracy
+"""
+
 import torch
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
 from torch.utils.data import DataLoader
-import time
+from datetime import datetime
 import pandas as pd
 import os
 

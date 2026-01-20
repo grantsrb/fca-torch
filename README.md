@@ -30,6 +30,129 @@ pip install fca
 
 ## 🧪 Example Usage
 
+### Quick Start: Simple MLP
+
+```python
+import torch
+import torch.nn as nn
+from fca import FunctionalComponentAnalysis, attach_fca
+
+# Define a simple model
+model = nn.Sequential(
+    nn.Linear(10, 64),
+    nn.ReLU(),
+    nn.Linear(64, 2),
+)
+model.eval()
+
+# Create FCA for the first linear layer (64 output features)
+fca = FunctionalComponentAnalysis(size=64, init_rank=5)
+
+# Attach FCA to the layer
+handle = attach_fca(
+    model=model,
+    layer_name="0",  # First layer in Sequential
+    fca_instance=fca,
+    output_format="tensor",
+)
+
+# Run inference - FCA will project activations
+output = model(torch.randn(4, 10))
+handle.remove()  # Clean up when done
+```
+
+### Vision Models (ResNet, CNN)
+
+```python
+import torch
+import torchvision.models as models
+from fca import FunctionalComponentAnalysis, attach_fca
+
+# Load pretrained ResNet
+model = models.resnet18(weights="IMAGENET1K_V1").eval()
+
+# FCA for layer1 (64 channels)
+fca = FunctionalComponentAnalysis(size=64, init_rank=10)
+
+# Attach with image format - handles (B, C, H, W) tensors
+handle = attach_fca(
+    model=model,
+    layer_name="layer1.0.conv2",
+    fca_instance=fca,
+    output_format="image",  # Automatically reshapes (B,C,H,W) -> (B*H*W,C)
+)
+
+# Run inference
+output = model(torch.randn(1, 3, 224, 224))
+handle.remove()
+
+# For deeper layers with more channels
+fca_deep = FunctionalComponentAnalysis(size=512, init_rank=20)
+handle = attach_fca(
+    model=model,
+    layer_name="layer4.1.conv2",
+    fca_instance=fca_deep,
+    output_format="image",
+)
+```
+
+### Language Models (HuggingFace Transformers)
+
+```python
+import torch
+from transformers import AutoModel, AutoTokenizer
+from fca import FunctionalComponentAnalysis, attach_fca
+
+# Load BERT
+model = AutoModel.from_pretrained("bert-base-uncased").eval()
+tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+
+# FCA for transformer hidden states (768 dimensions)
+fca = FunctionalComponentAnalysis(size=768, init_rank=10)
+
+# Attach to encoder layer output
+handle = attach_fca(
+    model=model,
+    layer_name="encoder.layer.5.output.dense",
+    fca_instance=fca,
+    output_format="sequence",  # Handles (B, S, D) -> (B*S, D)
+)
+
+# Run inference
+inputs = tokenizer("Hello world!", return_tensors="pt")
+outputs = model(**inputs)
+handle.remove()
+```
+
+### Custom Architectures
+
+For models with custom output formats, use extractors and transforms:
+
+```python
+import torch
+from fca import (
+    FunctionalComponentAnalysis,
+    attach_fca,
+    dict_extractor,
+    sequence_to_flat,
+    flat_to_sequence,
+)
+
+# For a model that outputs {"features": tensor, "attention": tensor}
+fca = FunctionalComponentAnalysis(size=256, init_rank=8)
+
+handle = attach_fca(
+    model=my_model,
+    layer_name="encoder.layer3",
+    fca_instance=fca,
+    output_extractor=dict_extractor("features"),  # Extract 'features' key
+    shape_transform=sequence_to_flat,
+    inverse_transform=flat_to_sequence,
+)
+```
+
+### Finding Sufficient Components (Full Training)
+
 ```python
 from collections import OrderedDict
 import torch
@@ -37,80 +160,93 @@ import torch.nn as nn
 from fca import FunctionalComponentAnalysis
 from fca.wrappers import wrap_data, CategoricalModelWrapper
 
-
-# Load or define your model
-in_dim = 2
-d_model = 24 # The dimensionality of your model
-out_dim = 2
+# Define model
 model = CategoricalModelWrapper(
     nn.Sequential(OrderedDict([
-        ("layer1", nn.Linear(in_dim, d_model)),
-        ("layer2", nn.Linear(d_model, out_dim)),
+        ("layer1", nn.Linear(2, 24)),
+        ("layer2", nn.Linear(24, 2)),
     ]))
 )
-for p in model.parameters(): p.requires_grad = False # Freeze weights
+for p in model.parameters():
+    p.requires_grad = False
 
-# Create the FCA Object
-target_layer = "layer1" # The name of the layer you wish to analyze
-n_components = 2 # The number of initial fca components
-max_rank = 2 # sets a limit on how many components can be used for finding
-    # a functionally sufficient circuit
-orth_with_doubles = True # Orthogonalize using double precision
-fca_object = FunctionalComponentAnalysis(
-    size=d_model,
-    init_rank=1, # Can argue an intitial number of components here
-    max_rank=max_rank,
-    orth_with_doubles=orth_with_doubles,
-)
-# Can add new components using the `add_component` function
-for _ in range(n_components-1):
-    fca_object.add_component()
-
-# Create the dataset. The keyword "labels" is treated differently, otherwise
-# use the keywords that your model's forward function uses. If it does
-# not use kwargs as in this example, any keyword will work. "inputs" is arbitrary
-n_samples = 100
-raw_data = {
-    "inputs": torch.randn(n_samples, in_dim),
-    "labels": torch.randint(out_dim,(n_samples,)),
-}
-complement_data = { # Can set to None if don't want to train FCA complement
-    "inputs": torch.randn(n_samples, in_dim),
-    "labels": torch.randint(out_dim,(n_samples,)),
-}
-data_loader = wrap_data(
-    data=raw_data,
-    complement_data=complement_data,
-    shuffle=True,
-    batch_size=128,
+# Create FCA
+fca = FunctionalComponentAnalysis(
+    size=24,
+    init_rank=1,
+    max_rank=10,
+    orth_with_doubles=True,
 )
 
-# Run FCA to find functionally sufficient components
-n_samples = 100
-fca_object.find_sufficient_components(
+# Prepare data
+data = {
+    "inputs": torch.randn(100, 2),
+    "labels": torch.randint(2, (100,)),
+}
+data_loader = wrap_data(data, shuffle=True, batch_size=32)
+
+# Train to find minimal sufficient components
+fca.find_sufficient_components(
     model=model,
-    layer=target_layer,
+    layer="layer1",
     data_loader=data_loader,
-    n_epochs=100, # set a limit on the number of data iterations
-    acc_threshold=0.99, # stop when the FCA object achieves this accuracy
-        # on the desired behavior or when epoch limit is reached
+    n_epochs=100,
+    acc_threshold=0.99,
 )
 
-# Inspect the components
-print("Minimal sufficient component vectors:", fca_object.weight)
-
+print(f"Found {fca.rank} sufficient components")
+print("Component vectors:", fca.weight)
 ```
 
 ## 🧰 API Highlights
 
-### `FunctionalComponentAnalysis()`
-Initializes the FCA analyzer for a given model and layer of interest.
+### Core Classes
 
-### `find_sufficient_components(input, target, strategy='greedy', threshold=0.05)`
-Finds a subset of components (e.g., neurons or features) in the layer that are sufficient to approximate the original model output.
+#### `FunctionalComponentAnalysis(size, init_rank=1, max_rank=None, orth_method="classical", ...)`
+The main FCA class for learning orthogonal functional components.
 
-### `ablate_components(indices)`
-Zeroes out selected components for functional probing.
+**Orthogonalization Methods** (`orth_method` parameter):
+- `"classical"` (default): Fast matrix-based orthogonalization using covariance matrix caching. Best performance but may lose orthogonality at very high ranks (>100).
+- `"modified"`: Modified Gram-Schmidt with O(e*k) error vs O(e*k^2) for classical. More numerically stable, recommended for high ranks.
+- `"householder"`: QR decomposition using PyTorch's optimized LAPACK backend. Most stable method, best for batch initialization.
+- `"hybrid"`: Classical for frozen components (fast), MGS for trainable components (stable). Recommended for training scenarios.
+
+```python
+# Example: Using different orthogonalization methods
+fca_fast = FunctionalComponentAnalysis(size=512, init_rank=20, orth_method="classical")
+fca_stable = FunctionalComponentAnalysis(size=512, init_rank=100, orth_method="modified")
+fca_most_stable = FunctionalComponentAnalysis(size=512, init_rank=50, orth_method="householder")
+fca_training = FunctionalComponentAnalysis(size=512, init_rank=10, orth_method="hybrid")
+
+# Periodic re-orthogonalization during training
+fca_training.reorthogonalize()  # Uses Householder QR to correct numerical drift
+```
+
+#### `PCAFunctionalComponentAnalysis(X, scale=True, center=True, ...)`
+FCA initialized with PCA components from data.
+
+### Convenience Functions
+
+#### `attach_fca(model, layer_name, fca_instance, output_format="auto", ...)`
+High-level function to attach FCA to any PyTorch model layer. Handles common output formats automatically.
+
+#### `get_layer_output_size(model, layer_name, sample_input=None)`
+Helper to determine the output size of a layer for FCA initialization.
+
+### Output Extractors
+
+Built-in extractors for common model output formats:
+- `identity_extractor` - For raw tensor outputs
+- `first_element_extractor` - For tuple outputs `(tensor, ...)`
+- `dict_extractor(key)` - For dict outputs with custom keys
+- `last_hidden_state_extractor` - For HuggingFace model outputs
+
+### Shape Transforms
+
+Built-in transforms for different tensor shapes:
+- `image_to_flat` / `flat_to_image` - For (B, C, H, W) image tensors
+- `sequence_to_flat` / `flat_to_sequence` - For (B, S, D) sequence tensors
+- `vit_to_flat` / `flat_to_vit` - For Vision Transformer outputs
 
 ## 📚 Documentation
 
