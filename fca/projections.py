@@ -370,12 +370,33 @@ def perform_eigen_pca(
     ## Cov = (1 / (M - 1)) * X^T X
     #cov = X.T @ X / (X.shape[0] - 1)  # shape (N, N)
 
-    # Compute eigenvalues and eigenvectors
-    eigvals, eigvecs = eigen_fn(cov)  # eigvals in ascending order
+    # Force symmetry and add regularization for numerical stability
+    if type(X) == torch.Tensor:
+        cov = (cov + cov.T) / 2
+        cov = cov + torch.eye(cov.shape[0], device=cov.device, dtype=cov.dtype) * 1e-6
+    else:
+        cov = (cov + cov.T) / 2
+        cov = cov + np.eye(cov.shape[0]) * 1e-6
 
-    # Select top n_components in descending order
-    eigvals = eigvals[-n_components:].flip(0)
-    eigvecs = eigvecs[:, -n_components:].flip(1)  # shape (N, n_components)
+    # Compute eigenvalues and eigenvectors
+    # Try original dtype first, then float64 if that fails (float32 eigh can be unstable)
+    if type(X) == torch.Tensor:
+        orig_dtype = cov.dtype
+        try:
+            eigvals, eigvecs = eigen_fn(cov)
+        except RuntimeError:
+            # float32 eigh can fail on large matrices; use float64
+            cov64 = cov.double()
+            eigvals, eigvecs = eigen_fn(cov64)
+            eigvals = eigvals.to(orig_dtype)
+            eigvecs = eigvecs.to(orig_dtype)
+        # Select top n_components in descending order
+        eigvals = eigvals[-n_components:].flip(0)
+        eigvecs = eigvecs[:, -n_components:].flip(1)
+    else:
+        eigvals, eigvecs = eigen_fn(cov)
+        eigvals = eigvals[-n_components:][::-1]
+        eigvecs = eigvecs[:, -n_components:][:, ::-1]
 
     explained_variance = eigvals
     proportion_expl_var = explained_variance / explained_variance.sum()
