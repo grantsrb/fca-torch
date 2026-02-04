@@ -14,10 +14,12 @@ FCA provides tools to:
 
 ## 🚀 Installation
 
-You can install `fca` via pip:
+Clone the repo and install locally:
 
 ```bash
-pip install fca
+git clone https://github.com/grantsrb/fca-torch.git
+cd fca-torch
+pip install -e .
 ```
 
 ## 🧠 Key Features
@@ -276,14 +278,6 @@ If you use `fca` in your research, please cite:
 > Satchel Grant (2025). *Functional Component Analysis: Understanding Functionally Sufficient Circuits in Neural Networks*. [arXiv preprint](https://arxiv.org/abs/xxxx.xxxxx)
 
 ## 🛠 Development
-
-Clone the repo and install in editable mode:
-
-```bash
-git clone https://github.com/grantsrb/fca.git
-cd fca
-pip install -e .
-```
 
 Run tests:
 
