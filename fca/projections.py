@@ -311,6 +311,7 @@ def perform_eigen_pca(
         center=True,
         transform_data=False,
         batch_size=None,
+        device=None,
         verbose=True,
 ):
     """
@@ -365,7 +366,10 @@ def perform_eigen_pca(
     cov = get_cor_mtx(
         X,X,
         zscore=False,
-        batch_size=batch_size)
+        batch_size=batch_size,
+        device=device,
+        to_cpu=X.device.type == "cpu",
+    )
     ## Use eigendecomposition of the covariance matrix for efficiency
     ## Cov = (1 / (M - 1)) * X^T X
     #cov = X.T @ X / (X.shape[0] - 1)  # shape (N, N)
