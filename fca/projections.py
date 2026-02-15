@@ -115,7 +115,14 @@ def component_wise_expl_var(actvs, weight, eps=1e-6):
         cumu_expl_vars.append(torch.zeros_like(cumu_expl_vars[-1]))
     return torch.stack(expl_vars), torch.stack(cumu_expl_vars)
 
-def get_cor_mtx(X, Y, batch_size=500, to_numpy=False, zscore=True, device=None):
+def get_cor_mtx(
+    X, Y,
+    batch_size=500,
+    to_numpy=False,
+    zscore=True,
+    device=None,
+    to_cpu=True,
+):
     """
     Creates a correlation matrix for X and Y using the GPU
 
@@ -182,6 +189,8 @@ def get_cor_mtx(X, Y, batch_size=500, to_numpy=False, zscore=True, device=None):
     cor_mtx = cor_mtx/len(Y)
     if to_numpy:
         return cor_mtx.numpy()
+    if to_cpu:
+        return cor_mtx.cpu()
     return cor_mtx
 
 def perform_pca(
