@@ -140,3 +140,5 @@ analysis/*.sh
 
 *probably_deletable/*
 *probably_deletable*
+
+scripts/*
