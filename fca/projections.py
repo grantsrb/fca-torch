@@ -24,7 +24,11 @@ def explained_variance(
     mean_over_dims=False,
 ) -> torch.Tensor:
     """
-    Caculates the explained variance of the reps on the target reps.
+    Caculates the explained variance score of the reps on the target reps.
+    Note that this is slightly different from traditional explained
+    variance in that this function accounts for systematic bias of the
+    predictor using a ratio of variances rather than a numerator of
+    squared residuals.
     
     Args:
         preds: torch tensor (B,D)
