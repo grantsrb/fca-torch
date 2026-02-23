@@ -19,17 +19,16 @@ def matrix_projinv(x, W):
 
 def explained_variance(
     preds: torch.Tensor,
-    labels:torch.Tensor,
+    labels: torch.Tensor,
     eps: float = 1e-8,
     mean_over_dims=False,
 ) -> torch.Tensor:
     """
-    Caculates the explained variance score of the reps on the target reps.
-    Note that this is slightly different from traditional explained
-    variance in that this function accounts for systematic bias of the
-    predictor using a ratio of variances rather than a numerator of
-    squared residuals.
-    
+    Traditional explained variance (R²): 1 - SS_res / SS_tot per dimension.
+
+    SS_res = mean((preds - labels)²)   per dimension
+    SS_tot = mean((labels - mean(labels))²)  per dimension
+
     Args:
         preds: torch tensor (B,D)
         labels: torch tensor (B,D)
@@ -44,7 +43,46 @@ def explained_variance(
             we can average over this value if mean_over_dims is true.
     """
     assert preds.shape == labels.shape, "Shapes of preds and labels must match"
-    
+
+    ss_res = ((labels - preds) ** 2).mean(dim=0)          # shape (D,)
+    mu = labels.mean(dim=0, keepdim=True)                  # shape (1, D)
+    ss_tot = ((labels - mu) ** 2).mean(dim=0)              # shape (D,)
+
+    expl_var = 1 - ss_res / (ss_tot + eps)                 # shape (D,)
+    if mean_over_dims:
+        return expl_var.mean()
+    return expl_var
+
+
+def explained_variance_score(
+    preds: torch.Tensor,
+    labels: torch.Tensor,
+    eps: float = 1e-8,
+    mean_over_dims=False,
+) -> torch.Tensor:
+    """
+    Explained variance score: 1 - var(residual) / var(labels) per dimension.
+
+    This differs from traditional explained variance (R²) in that it uses
+    a ratio of variances rather than a ratio of mean squared errors.
+    This accounts for systematic bias of the predictor — if the predictor
+    has a constant offset, this metric is unaffected while R² is penalized.
+
+    Args:
+        preds: torch tensor (B,D)
+        labels: torch tensor (B,D)
+        eps: float
+            small constant to prevent division by zero
+        mean_over_dims: bool
+            if true, will return the mean explained variance over the
+            feature dimensions
+    Returns:
+        expl_var: torch tensor (D,) or (1,)
+            we get an explained variance value for each dimension, but
+            we can average over this value if mean_over_dims is true.
+    """
+    assert preds.shape == labels.shape, "Shapes of preds and labels must match"
+
     diff = labels - preds
     var_diff = torch.var(diff, dim=0, unbiased=True)    # shape (D,)
     var_labels = torch.var(labels, dim=0, unbiased=True)# shape (D,)
@@ -57,18 +95,18 @@ def explained_variance(
 def projinv_expl_variance(x,W):
     """
     Projects x into W and inverts the projection to create z. Then
-    returns the explained variance of x using z.
+    returns the explained variance score of x using z.
 
     Args:
         x: torch tensor (B,D)
         W: torch tensor (D,P)
     Returns:
         explained_variance: torch tensor (1,)
-            the explained variance of the activations projected into W
-            and then returned to their original space.
+            the explained variance score of the activations projected
+            into W and then returned to their original space.
     """
     preds = matrix_projinv(x,W)
-    return explained_variance(preds, x)
+    return explained_variance_score(preds, x)
 
 def lost_variance(x,W):
     """
@@ -108,11 +146,11 @@ def component_wise_expl_var(actvs, weight, eps=1e-6):
     for comp in range(n_components):
         W = S[comp]*torch.matmul(U[:,comp:comp+1], Vt[comp:comp+1, :])
         preds = matrix_projinv(actvs, W=W)
-        expl_var = explained_variance(preds, actvs)
+        expl_var = explained_variance_score(preds, actvs)
         expl_vars.append(expl_var)
 
         cumu_sum += preds
-        expl_var =  explained_variance(cumu_sum, actvs)
+        expl_var = explained_variance_score(cumu_sum, actvs)
         cumu_expl_vars.append(expl_var)
     for _ in range(max(*weight.shape)-n_components):
         expl_vars.append(torch.zeros_like(expl_vars[-1]))
@@ -435,7 +473,8 @@ def perform_eigen_pca(
 
 
 __all__ = [
-    "matrix_projinv", "projinv_expl_variance", "lost_variance", "explained_variance",
+    "matrix_projinv", "projinv_expl_variance", "lost_variance",
+    "explained_variance", "explained_variance_score",
     "component_wise_expl_var", "perform_pca",
 ]
 
@@ -447,6 +486,6 @@ if __name__=="__main__":
     print("\tSum:", indys.mean(-1).sum(0))
     print("Cumu Components:", cumu.mean(-1))
     preds = matrix_projinv(U,U)
-    assert cumu.mean(-1)[-1]==explained_variance(preds, U).mean()
-    assert explained_variance(preds, U).mean()==projinv_expl_variance(U,U).mean()
+    assert cumu.mean(-1)[-1]==explained_variance_score(preds, U).mean()
+    assert explained_variance_score(preds, U).mean()==projinv_expl_variance(U,U).mean()
     assert lost_variance(U, U).mean()==(1-projinv_expl_variance(U,U).mean())
