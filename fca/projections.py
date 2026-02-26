@@ -333,13 +333,15 @@ def perform_pca(
     # X = U @ diag(S) @ Vh, where Vh contains the principal components as its rows
     if verbose: print("Performing SVD")
     U, S, Vh = svd(X, **svd_kwargs)
-    
+    S = S**2 / (X.shape[0] - 1)
+    tot_expl_var = S.sum()
+
     # The principal components (eigenvectors) are the first n_components rows of Vh
     components = Vh[:n_components]
     
     # Explained variance for each component can be computed from the singular values
-    explained_variance = (S[:n_components] ** 2) / (X.shape[0] - 1)
-    proportion_expl_var = explained_variance/explained_variance.sum()
+    explained_variance = S[:n_components]
+    proportion_expl_var = explained_variance/tot_expl_var
     
     ret_dict = {
         "components": components,
@@ -421,17 +423,19 @@ def perform_eigen_pca(
         device=device,
         to_cpu=X.device.type == "cpu",
     )
-    ## Use eigendecomposition of the covariance matrix for efficiency
-    ## Cov = (1 / (M - 1)) * X^T X
-    #cov = X.T @ X / (X.shape[0] - 1)  # shape (N, N)
+    # get_cor_mtx divides by N (biased). Convert to unbiased covariance
+    # by scaling: Cov_unbiased = X^T X / (N-1) = (X^T X / N) * N/(N-1)
+    N = X.shape[0]
+    cov = cov * (N / (N - 1))
 
     # Force symmetry and add regularization for numerical stability
+    REG = 1e-6
     if type(X) == torch.Tensor:
         cov = (cov + cov.T) / 2
-        cov = cov + torch.eye(cov.shape[0], device=cov.device, dtype=cov.dtype) * 1e-6
+        cov = cov + torch.eye(cov.shape[0], device=cov.device, dtype=cov.dtype) * REG
     else:
         cov = (cov + cov.T) / 2
-        cov = cov + np.eye(cov.shape[0]) * 1e-6
+        cov = cov + np.eye(cov.shape[0]) * REG
 
     # Compute eigenvalues and eigenvectors
     # Try original dtype first, then float64 if that fails (float32 eigh can be unstable)
@@ -445,16 +449,22 @@ def perform_eigen_pca(
             eigvals, eigvecs = eigen_fn(cov64)
             eigvals = eigvals.to(orig_dtype)
             eigvecs = eigvecs.to(orig_dtype)
+        # Remove the regularization shift: eigvals(cov + reg*I) = eigvals(cov) + reg
+        eigvals = (eigvals - REG).clamp(min=0)
+        tot_expl_var = eigvals.sum()
         # Select top n_components in descending order
         eigvals = eigvals[-n_components:].flip(0)
         eigvecs = eigvecs[:, -n_components:].flip(1)
     else:
         eigvals, eigvecs = eigen_fn(cov)
+        # Remove the regularization shift
+        eigvals = np.maximum(eigvals - REG, 0)
+        tot_expl_var = eigvals.sum()
         eigvals = eigvals[-n_components:][::-1]
         eigvecs = eigvecs[:, -n_components:][:, ::-1]
 
     explained_variance = eigvals
-    proportion_expl_var = explained_variance / explained_variance.sum()
+    proportion_expl_var = explained_variance / tot_expl_var
     components = eigvecs.T  # shape (n_components, N)
 
     ret_dict = {

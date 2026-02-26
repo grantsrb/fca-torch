@@ -123,7 +123,7 @@ if __name__=="__main__":
         print("Performing PCA")
         pca = perform_pca(X, center=True, scale=True)
 
-        exp_var = pca["prop_explained_variance"].cpu().data.numpy()
+        exp_var = pca["proportion_expl_var"].cpu().data.numpy()
         print(
             "Explained Variance",
             [round(x, 3) for x in exp_var])
